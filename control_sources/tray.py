@@ -1,6 +1,6 @@
 from gui import PopupPanel, create_tray_icon
 from monitor import DDCCI_Monitor, ddc_ci_monitors_list
-from screen_tuning import config
+from ddcci_screen_tuning import config
 
 
 class TrayControlSource:

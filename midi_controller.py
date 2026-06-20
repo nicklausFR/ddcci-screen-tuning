@@ -2,7 +2,7 @@ import mido
 import threading
 import time
 from monitor import DDCCI_Monitor
-from screen_tuning import config
+from ddcci_screen_tuning import config
 from midi_qt_signals import bus
 
 class MidiController:

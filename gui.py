@@ -2,7 +2,7 @@ from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, 
 from PySide6.QtGui import QIcon, QFont, QAction, QColor, QPainter, QPen, QBrush, QPalette
 from PySide6.QtCore import Qt, QSize, QTimer, Signal
 from monitor import DDCCI_Monitor
-from screen_tuning import PresetManager, config
+from ddcci_screen_tuning import PresetManager, config
 import sys
 import math
 import platform

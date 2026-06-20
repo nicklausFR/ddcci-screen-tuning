@@ -1,5 +1,7 @@
-import yaml
 import os
+
+import yaml
+
 
 class Config:
     def __init__(self, path="config.yaml"):
@@ -44,6 +46,7 @@ class Config:
 
         with open(self._path, "w", encoding="utf-8") as f:
             f.writelines(lines)
+
 
 config = Config()
 

@@ -1,7 +1,7 @@
 import math
 
 from platform_backends import load_monitor_backend
-from screen_tuning import config
+from ddcci_screen_tuning import config
 
 
 NIGHTLIGHT_WHITE_KELVIN = 6500
