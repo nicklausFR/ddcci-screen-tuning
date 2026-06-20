@@ -10,3 +10,5 @@ dist/
 .vscode/
 .agents/
 .codex/
+LOCAL_NOTES.md
+makeEXE.bat
