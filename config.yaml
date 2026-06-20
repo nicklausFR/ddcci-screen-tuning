@@ -1,0 +1,32 @@
+SLIDER_DEBOUNCE: 0.1
+
+BRIGHTNESS_RANGE: [0, 100]
+CONTRAST_RANGE: [0, 100]
+NIGHTLIGHT_RANGE: [0, 100]
+NIGHTLIGHT_NEUTRAL_RGB: [50, 50, 50]
+NIGHTLIGHT_TARGET_RGB: [100, 40, 8]
+
+LIGHT_MODE: true
+LIGHT_CURVE: 0.75
+LIGHT_CURVE_POINTS: [0, 30, 41, 47, 59, 68, 77, 77, 86, 90, 100]
+LIGHT_BRIGHTNESS_RANGE: [0, 100]
+LIGHT_CONTRAST_RANGE: [35, 75]
+
+# MIDI control is experimental and not part of the tested v1.0 feature set.
+# MIDI_DEBOUNCE: 0.1
+# MIDI_ON: 0
+# MidiDeviceName: "Pico"
+# MidiNightlightIntensity: 2
+# MidiBrightnessChannel: 3
+# MidiContrastChannel: 4
+# MidiVolumeChannel: 0
+# MidiLoopBackDevice: "Pico LoopBack"
+# MidiRedirectPorts: [1]
+# MidiCCNumber: 7
+# LOOPBACK: true
+LAST_BRIGHTNESS: 72
+LAST_CONTRAST: 69
+LAST_NIGHTLIGHT: 40
+LAST_LIGHT: 54
+DETAIL_ROWS_VISIBLE: true
+SELECTED_MONITOR_INDEX: 0

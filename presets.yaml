@@ -1,0 +1,18 @@
+test3:
+  brightness: 47
+  contrast: 48
+  nightlight: 50
+  nightlight_target_rgb:
+  - 100
+  - 35
+  - 7
+  light: 71
+Neutre:
+  brightness: 25
+  contrast: 55
+  nightlight: 0
+  nightlight_target_rgb:
+  - 100
+  - 35
+  - 7
+  light: 50
