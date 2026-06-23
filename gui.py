@@ -943,36 +943,42 @@ class PopupPanel(QWidget):
     def _safe_set_nightlight_target(self, target, apply_current=True):
         if self._panel_closed:
             return False
-        try:
-            self.monitor.nightlight_set_target_rgb(*target, apply_current=apply_current)
-            return True
-        except Exception as e:
-            print("[WARN] Failed to apply target color:", e)
-            return False
+        target = tuple(target)
+        submit_ddcci_command(
+            "nightlight",
+            "Nightlight target",
+            lambda monitor=self.monitor, target=target, apply_current=apply_current: monitor.nightlight_set_target_rgb(
+                *target,
+                apply_current=apply_current,
+            ),
+        )
+        return True
 
     def _safe_restore_nightlight_state(self, target_rgb, current_rgb=None, strength=None):
         if self._panel_closed:
             return False
-        try:
-            self.monitor.nightlight_set_target_rgb(*target_rgb, apply_current=False)
+        target_rgb = tuple(target_rgb)
+        current_rgb = tuple(current_rgb) if current_rgb is not None else None
+
+        def restore_state(monitor=self.monitor, target_rgb=target_rgb, current_rgb=current_rgb, strength=strength):
+            monitor.nightlight_set_target_rgb(*target_rgb, apply_current=False)
             if current_rgb is not None:
-                self.monitor.set_rgb(*current_rgb)
+                monitor.set_rgb(*current_rgb)
             elif strength is not None:
-                self.monitor.nightlight_set_strength(strength)
-            return True
-        except Exception as e:
-            print("[WARN] Failed to restore Nightlight state:", e)
-            return False
+                monitor.nightlight_set_strength(strength)
+
+        submit_ddcci_command("nightlight", "Nightlight restore", restore_state)
+        return True
 
     def _safe_set_nightlight_strength(self, strength):
         if self._panel_closed:
             return False
-        try:
-            self.monitor.nightlight_set_strength(strength)
-            return True
-        except Exception as e:
-            print("[WARN] Failed to apply Nightlight strength:", e)
-            return False
+        submit_ddcci_command(
+            "nightlight",
+            "Nightlight strength",
+            lambda monitor=self.monitor, strength=strength: monitor.nightlight_set_strength(strength),
+        )
+        return True
 
     def _safe_set_light_values(self, brightness, contrast):
         if self._panel_closed:
@@ -1425,7 +1431,7 @@ class PopupPanel(QWidget):
             original_strength = self.sliders["nightlight"].value()
         preview_active = {"value": False}
         applied = {"value": False}
-        preview_strength = {"value": original_strength if original_strength > 0 else 100}
+        preview_strength = {"value": 100}
         def update_color_label(target):
             color_label.setText(f"Estimated temperature: {self._rgb_to_kelvin(target)}K")
 
@@ -1597,12 +1603,12 @@ class PopupPanel(QWidget):
             round(max(0, min(100, channel)))
             for channel in raw
         ]
-        try:
-            self.monitor.set_rgb(*rgb)
-            return True
-        except Exception as e:
-            print("[WARN] Failed to apply Nightlight preview:", e)
-            return False
+        submit_ddcci_command(
+            "nightlight",
+            "Nightlight preview",
+            lambda monitor=self.monitor, rgb=tuple(rgb): monitor.set_rgb(*rgb),
+        )
+        return True
 
     def _relative_luma(self, rgb):
         r, g, b = [max(0.0, min(float(channel), 100.0)) / 100.0 for channel in rgb]
