@@ -8,6 +8,7 @@ from control_sources import TrayControlSource
 
 
 app = QApplication(sys.argv)
+app.setQuitOnLastWindowClosed(False)
 signal.signal(signal.SIGINT, lambda *_: app.quit())
 
 if platform.system() == "Windows":

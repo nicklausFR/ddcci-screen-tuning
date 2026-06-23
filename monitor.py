@@ -1,4 +1,5 @@
 import math
+import time
 
 from platform_backends import load_monitor_backend
 from ddcci_screen_tuning import config
@@ -67,23 +68,33 @@ class _NightlightColor:
         self._update_strength()
 
     def _strength_to_rgb(self, strength):
-        t = max(0, min(strength, 100)) / 100.0
+        t = max(0.0, min(float(strength), 100.0)) / 100.0
+        t = 1.0 - (1.0 - t) ** 1.8
         neutral_r, neutral_g, neutral_b = self.neutral_rgb
         target_r, target_g, target_b = self.target_rgb
 
-        raw_r = neutral_r + (target_r - neutral_r) * t
-        raw_g = neutral_g + (target_g - neutral_g) * t
-        raw_b = neutral_b + (target_b - neutral_b) * t
-
-        neutral_luma = self._relative_luma(neutral_r, neutral_g, neutral_b)
-        raw_luma = self._relative_luma(raw_r, raw_g, raw_b)
-        scale = neutral_luma / raw_luma if raw_luma > 0 else 1.0
-
         return (
-            round(max(0, min(100, raw_r * scale))),
-            round(max(0, min(100, raw_g * scale))),
-            round(max(0, min(100, raw_b * scale))),
+            round(max(0, min(100, neutral_r + (target_r - neutral_r) * t))),
+            round(max(0, min(100, neutral_g + (target_g - neutral_g) * t))),
+            round(max(0, min(100, neutral_b + (target_b - neutral_b) * t))),
         )
+
+    def _curve_value(self, name, x):
+        points = getattr(config, name, [0, 17, 33, 50, 67, 83, 100])
+        if not isinstance(points, (list, tuple)) or len(points) != 7:
+            points = [0, 17, 33, 50, 67, 83, 100]
+        try:
+            values = [max(0, min(100, float(point))) for point in points]
+        except (TypeError, ValueError):
+            values = [0, 17, 33, 50, 67, 83, 100]
+
+        t = max(0.0, min(float(x), 100.0)) / 100.0
+        while len(values) > 1:
+            values = [
+                values[index] + (values[index + 1] - values[index]) * t
+                for index in range(len(values) - 1)
+            ]
+        return values[0]
 
     def set_strength(self, percent):
         self.strength = max(0, min(percent, 100))
@@ -169,7 +180,10 @@ class DDCCI_Monitor:
     def __init__(self, index=0, cache_ttl=DEFAULT_READ_CACHE_TTL):
         self._monitor = _monitor_backend().open_monitor(index=index, cache_ttl=cache_ttl)
         self._nightlight_color = _NightlightColor()
-        self._sync_nightlight_color()
+        try:
+            self._sync_nightlight_color()
+        except Exception as e:
+            print("[WARN] Night Light RGB sync unavailable at startup:", e)
 
     def name(self):
         return self._monitor.name()
@@ -210,6 +224,16 @@ class DDCCI_Monitor:
 
     def set_contrast(self, value):
         self._monitor.set_contrast(value)
+
+    def set_light_values(self, brightness, contrast):
+        self.set_brightness(brightness)
+        try:
+            delay = max(0.0, float(getattr(config, "DDCCI_COMMAND_DELAY", 0.15)))
+        except (TypeError, ValueError):
+            delay = 0.15
+        if delay > 0:
+            time.sleep(delay)
+        self.set_contrast(contrast)
 
     def get_rgb(self):
         return self._monitor.get_rgb()
