@@ -1,5 +1,5 @@
-from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QSlider, QLabel, QPushButton, QComboBox, QSystemTrayIcon, QMenu, QDialog, QTabWidget)
-from PySide6.QtGui import QIcon, QFont, QAction, QColor, QPainter, QPen, QBrush, QPalette, QCursor
+from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QSlider, QLabel, QPushButton, QComboBox, QSystemTrayIcon, QMenu, QDialog, QTabWidget, QLineEdit)
+from PySide6.QtGui import QIcon, QFont, QAction, QActionGroup, QColor, QPainter, QPen, QBrush, QPalette, QCursor
 from PySide6.QtCore import Qt, QSize, QTimer, Signal
 from monitor import DDCCI_Monitor
 from ddcci_screen_tuning import PresetManager, config
@@ -7,10 +7,214 @@ from ddcci_command_queue import submit_ddcci_command, submit_light_values
 import sys
 import math
 import platform
+import time
 from midi_qt_signals import bus
+
+if platform.system() == "Windows":
+    try:
+        from gamma_ramp import apply_strength, reset_gamma
+    except Exception as e:
+        apply_strength = None
+        reset_gamma = None
+        print("[WARN] Windows gamma ramp unavailable:", e)
+else:
+    apply_strength = None
+    reset_gamma = None
 
 
 LIGHT_CURVE_POINT_COUNT = 7
+NIGHTLIGHT_BACKEND_DDCCI = "ddcci_rgb"
+NIGHTLIGHT_BACKEND_GAMMA = "gamma_ramp"
+
+
+class AmbientLuxGraph(QWidget):
+    thresholds_changed = Signal(float, float)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.samples = []
+        self.window_seconds = 10.0
+        self.lux_zero = 5.0
+        self.lux_full = 500.0
+        self.current_lux = None
+        self.current_filtered_lux = None
+        self.current_saturated = False
+        self._dragging = None
+        self._plot_rect = None
+        self._y_min_log = -1.0
+        self._y_max_log = 3.0
+        self._min_positive = 0.05
+        self.setMinimumHeight(235)
+        self.setMouseTracking(True)
+
+    def set_thresholds(self, lux_zero, lux_full):
+        self.lux_zero = max(0.001, float(lux_zero))
+        self.lux_full = max(self.lux_zero + 0.001, float(lux_full))
+        self.update()
+
+    def add_sample(self, lux, filtered_lux=None, saturated=False):
+        now = time.monotonic()
+        try:
+            lux = float(lux)
+        except (TypeError, ValueError):
+            return
+        try:
+            filtered_lux = float(filtered_lux) if filtered_lux is not None else None
+        except (TypeError, ValueError):
+            filtered_lux = None
+        self.current_lux = lux
+        self.current_filtered_lux = filtered_lux
+        self.current_saturated = bool(saturated)
+        self.samples.append((now, max(0.0, lux), filtered_lux))
+        cutoff = now - self.window_seconds
+        self.samples = [sample for sample in self.samples if sample[0] >= cutoff]
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        rect = self.rect().adjusted(52, 14, -58, -28)
+        painter.fillRect(self.rect(), QColor("#202020"))
+        painter.setPen(QPen(QColor("#555"), 1))
+        painter.drawRect(rect)
+
+        now = time.monotonic()
+        visible_samples = [sample for sample in self.samples if sample[0] >= now - self.window_seconds]
+        values = [self.lux_zero, self.lux_full]
+        for _, lux, filtered in visible_samples:
+            values.append(lux)
+            if filtered is not None:
+                values.append(filtered)
+        min_positive = self._min_positive
+        log_values = [math.log10(max(min_positive, value)) for value in values]
+        y_min = min(log_values)
+        y_max = max(log_values)
+        zero_log = math.log10(max(min_positive, self.lux_zero))
+        full_log = math.log10(max(min_positive, self.lux_full))
+        threshold_span = max(0.001, full_log - zero_log)
+        y_min = min(y_min, zero_log - max(0.22, threshold_span * 0.18))
+        y_max = max(y_max, full_log + max(0.16, threshold_span * 0.10))
+        padding = max(0.12, (y_max - y_min) * 0.12)
+        y_min -= padding
+        y_max += padding
+        if y_max <= y_min:
+            y_max = y_min + 1.0
+        self._plot_rect = rect
+        self._y_min_log = y_min
+        self._y_max_log = y_max
+
+        def x_for(timestamp):
+            return rect.left() + (timestamp - (now - self.window_seconds)) / self.window_seconds * rect.width()
+
+        def y_for(value):
+            log_value = math.log10(max(min_positive, value))
+            return rect.bottom() - (log_value - y_min) / (y_max - y_min) * rect.height()
+
+        for value, text, color in (
+            (self.lux_zero, "Lux 0%", QColor("#64b5f6")),
+            (self.lux_full, "Lux 100%", QColor("#ffb74d")),
+        ):
+            y = y_for(value)
+            painter.setPen(QPen(color, 1, Qt.DashLine))
+            painter.drawLine(rect.left(), round(y), rect.right(), round(y))
+            painter.drawText(rect.right() + 6, round(y) + 4, text)
+
+        painter.setPen(QPen(QColor("#aaa"), 1))
+        painter.drawText(rect.left(), self.height() - 8, "10s")
+        painter.drawText(rect.right() - 24, self.height() - 8, "now")
+        painter.drawText(4, rect.top() + 8, f"{10 ** y_max:.0f}")
+        painter.drawText(4, rect.bottom(), f"{10 ** y_min:.1f}")
+
+        if len(visible_samples) < 2:
+            painter.setPen(QPen(QColor("#888"), 1))
+            painter.drawText(rect.center().x() - 42, rect.center().y(), "No samples")
+            painter.end()
+            return
+
+        painter.setPen(QPen(QColor("#d8d8d8"), 2))
+        previous = None
+        for timestamp, lux, _ in visible_samples:
+            point = (round(x_for(timestamp)), round(y_for(lux)))
+            if previous is not None:
+                painter.drawLine(previous[0], previous[1], point[0], point[1])
+            previous = point
+
+        filtered_samples = [(timestamp, filtered) for timestamp, _, filtered in visible_samples if filtered is not None]
+        if len(filtered_samples) >= 2:
+            painter.setPen(QPen(QColor("#7fd36b"), 2))
+            previous = None
+            for timestamp, filtered in filtered_samples:
+                point = (round(x_for(timestamp)), round(y_for(filtered)))
+                if previous is not None:
+                    painter.drawLine(previous[0], previous[1], point[0], point[1])
+                previous = point
+        if self.current_lux is not None:
+            measured_y = round(y_for(self.current_filtered_lux if self.current_filtered_lux is not None else self.current_lux))
+            measured_y = max(rect.top() + 10, min(rect.bottom() - 4, measured_y))
+            painter.setPen(QPen(QColor("#7fd36b" if self.current_filtered_lux is not None else "#d8d8d8"), 1))
+            painter.drawText(4, measured_y + 4, f"{self.current_lux:.2f}")
+        painter.end()
+
+    def _y_for_lux(self, value):
+        if self._plot_rect is None:
+            return None
+        log_value = math.log10(max(self._min_positive, value))
+        return self._plot_rect.bottom() - (log_value - self._y_min_log) / (self._y_max_log - self._y_min_log) * self._plot_rect.height()
+
+    def _lux_for_y(self, y):
+        if self._plot_rect is None:
+            return None
+        y = max(self._plot_rect.top(), min(self._plot_rect.bottom(), y))
+        position = (self._plot_rect.bottom() - y) / self._plot_rect.height()
+        log_value = self._y_min_log + position * (self._y_max_log - self._y_min_log)
+        return max(self._min_positive, 10 ** log_value)
+
+    def _nearest_threshold(self, y):
+        zero_y = self._y_for_lux(self.lux_zero)
+        full_y = self._y_for_lux(self.lux_full)
+        if zero_y is None or full_y is None:
+            return None
+        zero_distance = abs(y - zero_y)
+        full_distance = abs(y - full_y)
+        if min(zero_distance, full_distance) > 12:
+            return None
+        return "zero" if zero_distance <= full_distance else "full"
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._dragging = self._nearest_threshold(event.position().y())
+            if self._dragging is not None:
+                self.setCursor(Qt.SizeVerCursor)
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._dragging is not None:
+            return
+        if self._nearest_threshold(event.position().y()) is not None:
+            self.setCursor(Qt.SizeVerCursor)
+        else:
+            self.setCursor(Qt.ArrowCursor)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self._dragging is not None:
+            self._move_threshold(event.position().y())
+            self._dragging = None
+            self.setCursor(Qt.ArrowCursor)
+            self.thresholds_changed.emit(self.lux_zero, self.lux_full)
+            return
+        super().mouseReleaseEvent(event)
+
+    def _move_threshold(self, y):
+        lux = self._lux_for_y(y)
+        if lux is None:
+            return
+        if self._dragging == "zero":
+            self.lux_zero = max(0.001, min(lux, self.lux_full - 0.001))
+        elif self._dragging == "full":
+            self.lux_full = max(self.lux_zero + 0.001, lux)
+        self.update()
 
 
 def _windows_uses_light_taskbar():
@@ -289,12 +493,31 @@ class CurveEditor(QWidget):
         self.update()
 
 class PopupPanel(QWidget):
-    def __init__(self, monitor, monitor_names=None, selected_monitor_index=0):
+    def __init__(
+        self,
+        monitor,
+        monitor_names=None,
+        selected_monitor_index=0,
+        on_nightlight_backend_changed=None,
+        ambient_source=None,
+        on_source_selected=None,
+        active_source="tray",
+        on_nightlight_source_selected=None,
+        active_nightlight_source="manual",
+    ):
         super().__init__()
         self.config = config
         self.monitor = monitor
         self.monitor_names = monitor_names or [self.monitor.name()]
         self.selected_monitor_index = selected_monitor_index
+        self.on_nightlight_backend_changed = on_nightlight_backend_changed
+        self.ambient_source = ambient_source
+        self.on_source_selected = on_source_selected
+        self.active_source = active_source
+        self.on_nightlight_source_selected = on_nightlight_source_selected
+        self.active_nightlight_source = active_nightlight_source
+        self._updating_source_selector = False
+        self._updating_nightlight_source_selector = False
         self._panel_closed = False
         self._monitor_load_attempts = 0
         self.light_mode = bool(getattr(self.config, "LIGHT_MODE", False))
@@ -314,11 +537,11 @@ class PopupPanel(QWidget):
 
         self.setWindowFlags(Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setFixedSize(280, 270 if self.light_mode else 240)
+        self.setFixedSize(280, 338 if self.light_mode else 308)
 
         self.bg = QWidget(self)
         self.bg.setStyleSheet("background-color: rgba(45, 45, 45, 230); border-radius: 12px;")
-        self.bg.setGeometry(0, 0, 280, 270 if self.light_mode else 240)
+        self.bg.setGeometry(0, 0, 280, 338 if self.light_mode else 308)
 
         layout = QVBoxLayout(self.bg)
         monitor_icon = QLabel()
@@ -359,7 +582,22 @@ class PopupPanel(QWidget):
         title_row.addWidget(close_button)
         layout.addLayout(title_row)
         layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(12)
+        layout.setSpacing(10)
+
+        source_row = QHBoxLayout()
+        source_label = QLabel("Light control")
+        source_label.setStyleSheet("color: white;")
+        self.source_selector = QComboBox()
+        self.source_selector.setInsertPolicy(QComboBox.NoInsert)
+        self.source_selector.addItem("Manual", "tray")
+        self.source_selector.addItem("Sensor", "ambient")
+        self.source_selector.addItem("Daytime", "daytime")
+        self.source_selector.setStyleSheet("color: white; background-color: #333; border-radius: 4px; padding: 2px;")
+        self.source_selector.currentIndexChanged.connect(self._source_selector_changed)
+        source_row.addWidget(source_label)
+        source_row.addWidget(self.source_selector, 1)
+        layout.addLayout(source_row)
+        self.set_source_control(active_source)
 
         icon_paths = {
             "light": "icons/auto_dark.png",
@@ -376,6 +614,22 @@ class PopupPanel(QWidget):
             visible_sliders.insert(0, "light")
 
         for name in visible_sliders:
+            if name == "nightlight":
+                nightlight_source_row = QHBoxLayout()
+                nightlight_source_label = QLabel("Color control")
+                nightlight_source_label.setStyleSheet("color: white;")
+                self.nightlight_source_selector = QComboBox()
+                self.nightlight_source_selector.setInsertPolicy(QComboBox.NoInsert)
+                self.nightlight_source_selector.addItem("Manual", "manual")
+                self.nightlight_source_selector.addItem("Daytime", "daytime")
+                self.nightlight_source_selector.addItem("Linked to light", "light_linked")
+                self.nightlight_source_selector.setStyleSheet("color: white; background-color: #333; border-radius: 4px; padding: 2px;")
+                self.nightlight_source_selector.currentIndexChanged.connect(self._nightlight_source_selector_changed)
+                nightlight_source_row.addWidget(nightlight_source_label)
+                nightlight_source_row.addWidget(self.nightlight_source_selector, 1)
+                layout.addLayout(nightlight_source_row)
+                self.set_nightlight_source_control(active_nightlight_source)
+
             icon_path = icon_paths[name]
             row = QHBoxLayout()
             row.setSpacing(10)
@@ -390,6 +644,8 @@ class PopupPanel(QWidget):
                 icon_btn.setCursor(Qt.PointingHandCursor)
                 icon_btn.setStyleSheet("background: transparent; border: none;")
                 icon_btn.clicked.connect(self.handle_nightlight_click)
+                icon_btn.setContextMenuPolicy(Qt.CustomContextMenu)
+                icon_btn.customContextMenuRequested.connect(self.show_nightlight_backend_menu)
                 self.nightlight_button = icon_btn
                 row.addWidget(icon_btn)
                 row_widgets.append(icon_btn)
@@ -448,7 +704,7 @@ class PopupPanel(QWidget):
                 if name == "light":
                     value_label.clicked.connect(self.choose_light_curve)
                 else:
-                    value_label.clicked.connect(self.choose_nightlight_target_color)
+                    value_label.clicked.connect(self.choose_nightlight_settings)
             else:
                 value_label = QLabel("49")
                 value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
@@ -492,6 +748,9 @@ class PopupPanel(QWidget):
         preset_combo.addItems(self.preset_manager.get_all_names())
 
         bus.midi_update.connect(self.handle_midi_update)
+        self.auto_source_timer = QTimer(self)
+        self.auto_source_timer.timeout.connect(self._sync_active_source_sliders)
+        self.auto_source_timer.start(100)
 
         def apply_preset(name):
             if preset_combo.isEditable() and preset_combo.lineEdit().hasFocus():
@@ -551,7 +810,7 @@ class PopupPanel(QWidget):
             if 'nightlight' in values:
                 nightlight = max(0, min(100, int(values['nightlight'])))
                 self._set_slider_silent("nightlight", nightlight)
-                self.monitor.nightlight_set_strength(nightlight)
+                self._safe_set_nightlight_strength(nightlight)
 
             self._remember_slider_values()
 
@@ -682,12 +941,16 @@ class PopupPanel(QWidget):
                 self._set_slider_silent("contrast", contrast)
 
             # nightlight (non bloquant)
-            try:
-                nightlight = self.monitor.nightlight_get_strength()
+            if self._nightlight_backend() == NIGHTLIGHT_BACKEND_GAMMA:
+                nightlight = self._config_int("LAST_NIGHTLIGHT", 0)
                 self._set_slider_silent("nightlight", nightlight)
-            except Exception as e:
-                print("[WARN] Night Light unavailable at startup:", e)
-                self._set_slider_silent("nightlight", 0)
+            else:
+                try:
+                    nightlight = self.monitor.nightlight_get_strength()
+                    self._set_slider_silent("nightlight", nightlight)
+                except Exception as e:
+                    print("[WARN] Night Light unavailable at startup:", e)
+                    self._set_slider_silent("nightlight", 0)
 
             self._remember_slider_values()
 
@@ -756,12 +1019,16 @@ class PopupPanel(QWidget):
             self._set_slider_silent("brightness", brightness)
             self._set_slider_silent("contrast", contrast)
 
-        try:
-            nightlight = self.monitor.nightlight_get_strength()
+        if self._nightlight_backend() == NIGHTLIGHT_BACKEND_GAMMA:
+            nightlight = self._config_int("LAST_NIGHTLIGHT", 0)
             self._set_slider_silent("nightlight", nightlight)
-        except Exception as e:
-            print("[WARN] Night Light unavailable at startup:", e)
-            self._set_slider_silent("nightlight", 0)
+        else:
+            try:
+                nightlight = self.monitor.nightlight_get_strength()
+                self._set_slider_silent("nightlight", nightlight)
+            except Exception as e:
+                print("[WARN] Night Light unavailable at startup:", e)
+                self._set_slider_silent("nightlight", 0)
 
         self._remember_slider_values()
 
@@ -776,6 +1043,54 @@ class PopupPanel(QWidget):
             return max(minimum, min(maximum, int(getattr(self.config, name, default))))
         except (TypeError, ValueError):
             return default
+
+    def _nightlight_backend(self):
+        backend = str(getattr(self.config, "NIGHTLIGHT_BACKEND", NIGHTLIGHT_BACKEND_DDCCI))
+        if backend == NIGHTLIGHT_BACKEND_GAMMA:
+            return NIGHTLIGHT_BACKEND_GAMMA
+        return NIGHTLIGHT_BACKEND_DDCCI
+
+    def _set_nightlight_backend(self, backend):
+        if backend not in (NIGHTLIGHT_BACKEND_DDCCI, NIGHTLIGHT_BACKEND_GAMMA):
+            backend = NIGHTLIGHT_BACKEND_DDCCI
+        previous_backend = self._nightlight_backend()
+        self.config.set("NIGHTLIGHT_BACKEND", backend)
+        if previous_backend == NIGHTLIGHT_BACKEND_GAMMA and backend != NIGHTLIGHT_BACKEND_GAMMA and reset_gamma is not None:
+            try:
+                reset_gamma()
+            except Exception as e:
+                print("[WARN] Gamma ramp reset failed:", e)
+        if previous_backend != NIGHTLIGHT_BACKEND_GAMMA and backend == NIGHTLIGHT_BACKEND_GAMMA:
+            submit_ddcci_command(
+                "nightlight",
+                "Nightlight RGB off",
+                lambda monitor=self.monitor: monitor.nightlight_set_strength(0),
+            )
+        self._safe_set_nightlight_strength(self.sliders["nightlight"].value())
+        if self.on_nightlight_backend_changed is not None:
+            self.on_nightlight_backend_changed(backend)
+
+    def _gamma_warm_kelvin(self):
+        try:
+            kelvin = int(getattr(self.config, "GAMMA_RAMP_WARM_KELVIN", 5000))
+        except (TypeError, ValueError):
+            kelvin = 5000
+        return max(1000, min(5000, kelvin))
+
+    def _apply_gamma_nightlight_strength(self, strength):
+        if apply_strength is None or reset_gamma is None:
+            print("[WARN] Gamma ramp backend unavailable on this system.")
+            return False
+        strength = max(0, min(100, int(strength)))
+        try:
+            if strength <= 0:
+                reset_gamma()
+            else:
+                apply_strength(self._gamma_warm_kelvin(), strength)
+            return True
+        except Exception as e:
+            print("[WARN] Gamma ramp Night Light failed:", e)
+            return False
 
     def _load_cached_values(self):
         cached = {
@@ -823,6 +1138,21 @@ class PopupPanel(QWidget):
         self.setFixedSize(280, height)
         self.bg.setGeometry(0, 0, 280, height)
         self.place_bottom_right()
+
+    def show_nightlight_backend_menu(self, position):
+        menu = QMenu(self)
+        ddcci_action = QAction("DDC/CI RGB", menu)
+        ddcci_action.setCheckable(True)
+        gamma_action = QAction("Gamma ramp", menu)
+        gamma_action.setCheckable(True)
+        backend = self._nightlight_backend()
+        ddcci_action.setChecked(backend == NIGHTLIGHT_BACKEND_DDCCI)
+        gamma_action.setChecked(backend == NIGHTLIGHT_BACKEND_GAMMA)
+        menu.addAction(ddcci_action)
+        menu.addAction(gamma_action)
+        ddcci_action.triggered.connect(lambda checked: self._set_nightlight_backend(NIGHTLIGHT_BACKEND_DDCCI))
+        gamma_action.triggered.connect(lambda checked: self._set_nightlight_backend(NIGHTLIGHT_BACKEND_GAMMA))
+        menu.exec(self.nightlight_button.mapToGlobal(position))
 
     def _config_range(self, name, default):
         value = getattr(self.config, name, default)
@@ -872,6 +1202,12 @@ class PopupPanel(QWidget):
             ) / 100.0))
             for i in range(LIGHT_CURVE_POINT_COUNT)
         ]
+
+    def _light_nightlight_curve_points(self):
+        points = self._validated_curve_points(getattr(self.config, "LIGHT_NIGHTLIGHT_CURVE_POINTS", None))
+        if points is not None:
+            return points
+        return [80, 65, 45, 25, 12, 4, 0]
 
     def _curve_points_to_slider_values(self, points, value_range):
         minimum, maximum = value_range
@@ -954,6 +1290,19 @@ class PopupPanel(QWidget):
         )
         return True
 
+    def _safe_apply_nightlight_target_and_strength(self, target, strength):
+        if self._panel_closed:
+            return False
+        target = tuple(target)
+        strength = max(0, min(100, int(strength)))
+
+        def apply_values(monitor=self.monitor, target=target, strength=strength):
+            monitor.nightlight_set_target_rgb(*target, apply_current=False)
+            monitor.nightlight_set_strength(strength)
+
+        submit_ddcci_command("nightlight", "Nightlight target and strength", apply_values)
+        return True
+
     def _safe_restore_nightlight_state(self, target_rgb, current_rgb=None, strength=None):
         if self._panel_closed:
             return False
@@ -973,6 +1322,8 @@ class PopupPanel(QWidget):
     def _safe_set_nightlight_strength(self, strength):
         if self._panel_closed:
             return False
+        if self._nightlight_backend() == NIGHTLIGHT_BACKEND_GAMMA:
+            return self._apply_gamma_nightlight_strength(strength)
         submit_ddcci_command(
             "nightlight",
             "Nightlight strength",
@@ -1152,13 +1503,343 @@ class PopupPanel(QWidget):
 
         self._light_curve_dialog = None
 
-    def open_display_settings(self):
+    def _build_gamma_ramp_settings(self, parent):
+        layout = QVBoxLayout(parent)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(8)
+
+        general_label = QLabel("General")
+        general_label.setStyleSheet("color: white; font-weight: bold;")
+        layout.addWidget(general_label)
+
+        reset_button = QPushButton("Reset gamma")
+        reset_button.setStyleSheet("""
+            QPushButton {
+                color: white;
+                background: #333;
+                border: 1px solid #555;
+                border-radius: 4px;
+                padding: 4px;
+            }
+            QPushButton:pressed {
+                background: #2d8cf0;
+            }
+        """)
+        layout.addWidget(reset_button)
+
+        target_label = QLabel("Nightlight target color")
+        target_label.setStyleSheet("color: white; font-weight: bold;")
+        layout.addWidget(target_label)
+
+        preview_button = QPushButton("Preview OFF")
+        preview_button.setCheckable(True)
+        preview_button.setStyleSheet("""
+            QPushButton {
+                color: white;
+                background: #333;
+                border: 1px solid #555;
+                border-radius: 4px;
+                padding: 4px;
+            }
+            QPushButton:checked {
+                background: #2d8cf0;
+            }
+        """)
+        layout.addWidget(preview_button)
+
+        temperature_label = QLabel()
+        temperature_label.setStyleSheet("color: white;")
+        layout.addWidget(temperature_label)
+
+        temperature_slider = QSlider(Qt.Orientation.Horizontal)
+        temperature_slider.setRange(1000, 5000)
+        temperature_slider.setFixedHeight(20)
+        temperature_slider.setInvertedAppearance(True)
+        temperature_slider.setValue(self._gamma_warm_kelvin())
+        temperature_slider.setStyleSheet("""
+            QSlider::groove:horizontal {
+                height: 8px;
+                border-radius: 4px;
+                background: qlineargradient(
+                    x1: 0, y1: 0, x2: 1, y2: 0,
+                    stop: 0.00 #d8efff,
+                    stop: 0.50 #ffd166,
+                    stop: 1.00 #ff7a1a
+                );
+            }
+            QSlider::handle:horizontal {
+                width: 14px;
+                background: #f4f4f4;
+                border: 1px solid #333;
+                margin: -4px 0;
+                border-radius: 7px;
+            }
+        """)
+        layout.addWidget(temperature_slider)
+
+        button_row = QHBoxLayout()
+        apply_button = QPushButton("Apply")
+        button_row.addStretch()
+        button_row.addWidget(apply_button)
+        layout.addLayout(button_row)
+        layout.addStretch()
+
+        original_strength = {"value": self.sliders["nightlight"].value()}
+        original_kelvin = self._gamma_warm_kelvin()
+        applied = {"value": False}
+        preview_active = {"value": False}
+
+        def update_label():
+            temperature_label.setText(f"Approx. temperature: {temperature_slider.value()}K")
+
+        def preview_temperature():
+            if preview_button.isChecked():
+                old_kelvin = self._gamma_warm_kelvin()
+                self.config.set("GAMMA_RAMP_WARM_KELVIN", temperature_slider.value())
+                self._apply_gamma_nightlight_strength(100)
+                self.config.set("GAMMA_RAMP_WARM_KELVIN", old_kelvin)
+
+        def reset_gamma_ramp():
+            preview_button.setChecked(False)
+            if reset_gamma is None:
+                print("[WARN] Gamma ramp reset unavailable on this system.")
+                return
+            try:
+                reset_gamma()
+                self._set_slider_silent("nightlight", 0)
+                original_strength["value"] = 0
+                self._remember_slider_values()
+            except Exception as e:
+                print("[WARN] Gamma ramp reset failed:", e)
+
+        def preview_toggled(checked):
+            preview_active["value"] = checked
+            preview_button.setText("Preview ON" if checked else "Preview OFF")
+            if checked:
+                preview_temperature()
+            elif self._nightlight_backend() == NIGHTLIGHT_BACKEND_GAMMA:
+                self._safe_set_nightlight_strength(original_strength["value"])
+            elif reset_gamma is not None:
+                try:
+                    reset_gamma()
+                except Exception as e:
+                    print("[WARN] Gamma ramp reset failed:", e)
+            else:
+                self._safe_set_nightlight_strength(original_strength["value"])
+
+        def apply_temperature():
+            applied["value"] = True
+            self.config.set("GAMMA_RAMP_WARM_KELVIN", temperature_slider.value())
+            strength = self.sliders["nightlight"].value()
+            original_strength["value"] = strength
+            if self._nightlight_backend() == NIGHTLIGHT_BACKEND_GAMMA:
+                self._safe_set_nightlight_strength(strength)
+            elif reset_gamma is not None:
+                try:
+                    reset_gamma()
+                except Exception as e:
+                    print("[WARN] Gamma ramp reset failed:", e)
+
+        preview_button.toggled.connect(preview_toggled)
+        reset_button.clicked.connect(reset_gamma_ramp)
+        temperature_slider.valueChanged.connect(lambda value: update_label())
+        temperature_slider.sliderReleased.connect(preview_temperature)
+        apply_button.clicked.connect(apply_temperature)
+        update_label()
+        return {
+            "applied": applied,
+            "preview_active": preview_active,
+            "original_strength": original_strength,
+            "original_kelvin": original_kelvin,
+        }
+
+    def _build_light_linked_nightlight_settings(self, parent):
+        layout = QVBoxLayout(parent)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(8)
+
+        source_row = QHBoxLayout()
+        source_label = QLabel("Nightlight")
+        source_label.setStyleSheet("color: white;")
+        source_combo = QComboBox()
+        source_combo.setInsertPolicy(QComboBox.NoInsert)
+        source_combo.addItem("Manual", "manual")
+        source_combo.addItem("Daytime", "daytime")
+        source_combo.addItem("Linked to light", "light_linked")
+        source_combo.setStyleSheet("color: white; background-color: #333; border-radius: 4px; padding: 2px;")
+        source_combo.setCurrentIndex(max(0, source_combo.findData(getattr(self.config, "NIGHTLIGHT_SOURCE", "manual"))))
+        source_row.addWidget(source_label)
+        source_row.addWidget(source_combo, 1)
+        layout.addLayout(source_row)
+
+        editor_label = QLabel("Light -> Nightlight")
+        editor_label.setStyleSheet("color: white; font-weight: bold;")
+        layout.addWidget(editor_label)
+
+        current_light = getattr(self.config, "LAST_LIGHT", None)
+        current_nightlight = None
+        if current_light is not None:
+            current_nightlight = self._curve_value_from_points(self._light_nightlight_curve_points(), current_light)
+        editor = CurveEditor(
+            self._light_nightlight_curve_points(),
+            x_labels=("Light 0%", "Light 50%", "Light 100%"),
+            y_label="Nightlight",
+            y_tick_labels={0: "0%", 50: "50%", 100: "100%"},
+            current_x=current_light,
+            current_y=current_nightlight,
+        )
+        layout.addWidget(editor)
+
+        button_row = QHBoxLayout()
+        reset_button = QPushButton("Reset")
+        apply_button = QPushButton("Apply")
+        button_row.addWidget(reset_button)
+        button_row.addStretch()
+        button_row.addWidget(apply_button)
+        layout.addLayout(button_row)
+        layout.addStretch()
+
+        def reset_points():
+            editor.points = [80, 65, 45, 25, 12, 4, 0]
+            if current_light is not None:
+                editor.current_y = self._curve_value_from_points(editor.points, current_light)
+            editor.update()
+
+        def apply_settings():
+            source = source_combo.currentData() or "manual"
+            self.config.set("LIGHT_NIGHTLIGHT_CURVE_POINTS", list(editor.points))
+            if self.on_nightlight_source_selected is not None:
+                self.on_nightlight_source_selected(source)
+            else:
+                self.config.set("NIGHTLIGHT_SOURCE", source)
+                self.set_nightlight_source_control(source)
+            if source == "light_linked" and current_light is not None:
+                value = round(self._curve_value_from_points(editor.points, current_light))
+                self._set_slider_silent("nightlight", value)
+                self._safe_set_nightlight_strength(value)
+                self._remember_slider_values()
+
+        reset_button.clicked.connect(reset_points)
+        apply_button.clicked.connect(apply_settings)
+        return {"save": apply_settings}
+
+    def _ambient_config_float(self, name, default, minimum, maximum):
+        try:
+            value = float(getattr(self.config, name, default))
+        except (TypeError, ValueError):
+            value = default
+        return max(minimum, min(maximum, value))
+
+    def _build_ambient_sensor_settings(self, parent):
+        layout = QVBoxLayout(parent)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(8)
+
+        def label(text, bold=False):
+            item = QLabel(text)
+            if bold:
+                item.setStyleSheet("color: white; font-weight: bold;")
+            else:
+                item.setStyleSheet("color: white;")
+            return item
+
+        field_style = "color: white; background: #333; border: 1px solid #555; border-radius: 4px; padding: 3px;"
+        graph = AmbientLuxGraph()
+        layout.addWidget(graph)
+
+        layout.addWidget(label("Calibration", bold=True))
+        min_lux_row = QHBoxLayout()
+        min_lux_row.addWidget(label("Lux 0%"))
+        min_lux_edit = QLineEdit(str(self._ambient_config_float("AMBIENT_MIN_LUX", 5.0, 0.001, 100000.0)))
+        min_lux_edit.setStyleSheet(field_style)
+        min_lux_row.addWidget(min_lux_edit)
+        layout.addLayout(min_lux_row)
+
+        max_lux_row = QHBoxLayout()
+        max_lux_row.addWidget(label("Lux 100%"))
+        max_lux_edit = QLineEdit(str(self._ambient_config_float("AMBIENT_MAX_LUX", 500.0, 0.001, 100000.0)))
+        max_lux_edit.setStyleSheet(field_style)
+        max_lux_row.addWidget(max_lux_edit)
+        layout.addLayout(max_lux_row)
+
+        smoothing_row = QHBoxLayout()
+        smoothing_row.addWidget(label("Smoothing (s)"))
+        smoothing_edit = QLineEdit(str(self._ambient_config_float("AMBIENT_SMOOTHING_SECONDS", 2.0, 0.0, 60.0)))
+        smoothing_edit.setStyleSheet(field_style)
+        smoothing_row.addWidget(smoothing_edit)
+        layout.addLayout(smoothing_row)
+        layout.addStretch()
+        updating_thresholds = {"active": False}
+
+        def parse_float(edit, fallback, minimum, maximum):
+            try:
+                value = float(edit.text().replace(",", "."))
+            except ValueError:
+                value = fallback
+            return max(minimum, min(maximum, value))
+
+        def save_settings():
+            min_lux = parse_float(min_lux_edit, 5.0, 0.001, 100000.0)
+            max_lux = parse_float(max_lux_edit, 500.0, min_lux + 0.001, 100000.0)
+            smoothing_seconds = parse_float(smoothing_edit, 2.0, 0.0, 60.0)
+            min_lux_edit.setText(f"{min_lux:g}")
+            max_lux_edit.setText(f"{max_lux:g}")
+            smoothing_edit.setText(f"{smoothing_seconds:g}")
+            self.config.set("AMBIENT_MIN_LUX", min_lux)
+            self.config.set("AMBIENT_MAX_LUX", max_lux)
+            self.config.set("AMBIENT_SMOOTHING_SECONDS", smoothing_seconds)
+            if not updating_thresholds["active"]:
+                graph.set_thresholds(min_lux, max_lux)
+
+        def format_number(value, decimals=2):
+            if value is None:
+                return "-"
+            try:
+                return f"{float(value):.{decimals}f}"
+            except (TypeError, ValueError):
+                return "-"
+
+        def refresh_status():
+            if self.ambient_source is None:
+                return
+            status = self.ambient_source.status()
+            if graph._dragging is None:
+                graph.set_thresholds(
+                    self._ambient_config_float("AMBIENT_MIN_LUX", 5.0, 0.001, 100000.0),
+                    self._ambient_config_float("AMBIENT_MAX_LUX", 500.0, 0.001, 100000.0),
+                )
+            graph.add_sample(status.get("lux"), status.get("filtered_lux"), status.get("saturated"))
+
+        def graph_thresholds_changed(min_lux, max_lux):
+            updating_thresholds["active"] = True
+            min_lux_edit.setText(f"{min_lux:.3g}")
+            max_lux_edit.setText(f"{max_lux:.3g}")
+            self.config.set("AMBIENT_MIN_LUX", min_lux)
+            self.config.set("AMBIENT_MAX_LUX", max_lux)
+            updating_thresholds["active"] = False
+
+        graph.thresholds_changed.connect(graph_thresholds_changed)
+        min_lux_edit.editingFinished.connect(save_settings)
+        max_lux_edit.editingFinished.connect(save_settings)
+        smoothing_edit.editingFinished.connect(save_settings)
+
+        status_timer = QTimer(parent)
+        status_timer.timeout.connect(refresh_status)
+        status_timer.start(100)
+        save_settings()
+        refresh_status()
+        return {"timer": status_timer, "save": save_settings}
+
+    def open_display_settings(self, initial_tab=None):
         dialog = QDialog(self)
         self._display_settings_dialog = dialog
         dialog.setWindowTitle("Display settings")
         dialog_width = 340
         light_height = 620
-        color_height = 305
+        color_height = 360
+        gamma_height = 315
+        nightlight_curve_height = 370
+        ambient_height = 475
         dialog.setFixedSize(dialog_width, light_height)
 
         layout = QVBoxLayout(dialog)
@@ -1186,7 +1867,19 @@ class PopupPanel(QWidget):
 
         color_tab = QWidget()
         color_controls = self._build_nightlight_color_settings(color_tab, include_cancel=False, preview_changes=False)
-        tabs.addTab(color_tab, "Nightlight color")
+        tabs.addTab(color_tab, "RGB color")
+
+        gamma_tab = QWidget()
+        gamma_controls = self._build_gamma_ramp_settings(gamma_tab)
+        tabs.addTab(gamma_tab, "Gamma ramp")
+
+        nightlight_curve_tab = QWidget()
+        nightlight_curve_controls = self._build_light_linked_nightlight_settings(nightlight_curve_tab)
+        tabs.addTab(nightlight_curve_tab, "Light-Nightlight link")
+
+        ambient_tab = QWidget()
+        ambient_controls = self._build_ambient_sensor_settings(ambient_tab)
+        tabs.addTab(ambient_tab, "Ambient sensor")
 
         layout.addWidget(tabs)
 
@@ -1206,11 +1899,24 @@ class PopupPanel(QWidget):
             applied = color_controls[4]
             original_strength = color_controls[5]
             original_current_rgb = color_controls[6]
-            if not applied["value"]:
+            color_preview_active = color_controls[2]
+            if color_preview_active["value"] and not applied["value"]:
                 self._safe_restore_nightlight_state(original_target_rgb, current_rgb=original_current_rgb)
-            else:
-                self._safe_set_nightlight_strength(original_strength)
-            self._set_slider_silent("nightlight", original_strength)
+                self._set_slider_silent("nightlight", original_strength["value"])
+            elif applied["value"]:
+                self._safe_set_nightlight_strength(original_strength["value"])
+                self._set_slider_silent("nightlight", original_strength["value"])
+            if gamma_controls["preview_active"]["value"] and not gamma_controls["applied"]["value"]:
+                self.config.set("GAMMA_RAMP_WARM_KELVIN", gamma_controls["original_kelvin"])
+                if self._nightlight_backend() == NIGHTLIGHT_BACKEND_GAMMA:
+                    self._safe_set_nightlight_strength(gamma_controls["original_strength"]["value"])
+                elif reset_gamma is not None:
+                    try:
+                        reset_gamma()
+                    except Exception as e:
+                        print("[WARN] Gamma ramp reset failed:", e)
+            nightlight_curve_controls["save"]()
+            ambient_controls["save"]()
 
         def close_display_settings():
             cleanup_display_settings()
@@ -1221,25 +1927,52 @@ class PopupPanel(QWidget):
         dialog.finished.connect(lambda result: setattr(self, "_display_settings_dialog", None))
 
         def resize_for_tab(index):
-            height = color_height if tabs.widget(index) is color_tab else light_height
+            if tabs.widget(index) is color_tab:
+                height = color_height
+            elif tabs.widget(index) is gamma_tab:
+                height = gamma_height
+            elif tabs.widget(index) is nightlight_curve_tab:
+                height = nightlight_curve_height
+            elif tabs.widget(index) is ambient_tab:
+                height = ambient_height
+            else:
+                height = light_height
             dialog.setFixedSize(dialog_width, height)
 
         tabs.currentChanged.connect(resize_for_tab)
+        if initial_tab == "rgb":
+            tabs.setCurrentWidget(color_tab)
+        elif initial_tab == "gamma":
+            tabs.setCurrentWidget(gamma_tab)
+        elif initial_tab == "nightlight_curve":
+            tabs.setCurrentWidget(nightlight_curve_tab)
+        elif initial_tab == "ambient":
+            tabs.setCurrentWidget(ambient_tab)
         QTimer.singleShot(0, lambda: resize_for_tab(tabs.currentIndex()))
         QTimer.singleShot(0, dialog.raise_)
         QTimer.singleShot(0, dialog.activateWindow)
         dialog.exec()
 
+    def choose_nightlight_settings(self):
+        if self._nightlight_backend() == NIGHTLIGHT_BACKEND_GAMMA:
+            self.open_display_settings(initial_tab="gamma")
+        else:
+            self.choose_nightlight_target_color()
+
     def handle_nightlight_click(self):
-        try:
-            current = self.monitor.nightlight_get_strength()
-        except Exception as e:
-            print("[WARN] Failed to read Night Light:", e)
-            return
+        if self._nightlight_backend() == NIGHTLIGHT_BACKEND_GAMMA:
+            current = self.sliders["nightlight"].value()
+        else:
+            try:
+                current = self.monitor.nightlight_get_strength()
+            except Exception as e:
+                print("[WARN] Failed to read Night Light:", e)
+                return
 
         if current > 0:
             self._last_nightlight_strength = current
-            self.monitor.nightlight_set_strength(0)
+            self._safe_set_nightlight_strength(0)
+            self._set_slider_silent("nightlight", 0)
             self.sliders['nightlight'].setEnabled(False)
             self.sliders['nightlight'].setStyleSheet("""
                 QSlider::groove:horizontal {
@@ -1255,7 +1988,8 @@ class PopupPanel(QWidget):
                 }
             """)
         elif self._last_nightlight_strength is not None:
-            self.monitor.nightlight_set_strength(self._last_nightlight_strength)
+            self._safe_set_nightlight_strength(self._last_nightlight_strength)
+            self._set_slider_silent("nightlight", self._last_nightlight_strength)
             self.sliders['nightlight'].setEnabled(True)
             self.sliders['nightlight'].setStyleSheet("""
                 QSlider::groove:horizontal {
@@ -1275,8 +2009,8 @@ class PopupPanel(QWidget):
         original_target = list(self.monitor.nightlight_get_target_rgb())
         dialog = QDialog(self)
         self._nightlight_target_dialog = dialog
-        dialog.setWindowTitle("Target Color")
-        dialog.setFixedSize(300, 245)
+        dialog.setWindowTitle("RGB color")
+        dialog.setFixedSize(300, 300)
 
         cancel_button, apply_button, preview_active, original_target_rgb, applied, original_strength, original_current_rgb = self._build_nightlight_color_settings(
             dialog,
@@ -1293,8 +2027,8 @@ class PopupPanel(QWidget):
         if not applied["value"]:
             self._safe_restore_nightlight_state(original_target_rgb, current_rgb=original_current_rgb)
         else:
-            self._safe_set_nightlight_strength(original_strength)
-        self._set_slider_silent("nightlight", original_strength)
+            self._safe_set_nightlight_strength(original_strength["value"])
+        self._set_slider_silent("nightlight", original_strength["value"])
         self.config.set("NIGHTLIGHT_TARGET_RGB", list(self.monitor.nightlight_get_target_rgb()))
         self._nightlight_target_dialog = None
 
@@ -1302,6 +2036,29 @@ class PopupPanel(QWidget):
         layout = QVBoxLayout(parent)
         layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(8)
+
+        general_label = QLabel("General")
+        general_label.setStyleSheet("color: white; font-weight: bold;")
+        layout.addWidget(general_label)
+
+        reset_rgb_button = QPushButton("Reset RGB monitor")
+        reset_rgb_button.setStyleSheet("""
+            QPushButton {
+                color: white;
+                background: #333;
+                border: 1px solid #555;
+                border-radius: 4px;
+                padding: 4px;
+            }
+            QPushButton:pressed {
+                background: #2d8cf0;
+            }
+        """)
+        layout.addWidget(reset_rgb_button)
+
+        target_section_label = QLabel("Nightlight target color")
+        target_section_label.setStyleSheet("color: white; font-weight: bold;")
+        layout.addWidget(target_section_label)
 
         preview_button = QPushButton("Preview OFF")
         preview_button.setCheckable(True)
@@ -1425,15 +2182,27 @@ class PopupPanel(QWidget):
         original_target_rgb = list(target_rgb)
         try:
             original_current_rgb = list(self.monitor.get_rgb())
-            original_strength = self.monitor.nightlight_get_strength()
+            original_strength = {"value": self.monitor.nightlight_get_strength()}
         except Exception:
             original_current_rgb = list(target_rgb)
-            original_strength = self.sliders["nightlight"].value()
+            original_strength = {"value": self.sliders["nightlight"].value()}
         preview_active = {"value": False}
         applied = {"value": False}
         preview_strength = {"value": 100}
+
+        def reset_rgb_monitor():
+            preview_button.setChecked(False)
+            submit_ddcci_command(
+                "nightlight",
+                "Reset RGB monitor",
+                lambda monitor=self.monitor: monitor.nightlight_set_strength(0),
+            )
+            self._set_slider_silent("nightlight", 0)
+            original_strength["value"] = 0
+            self._remember_slider_values()
+
         def update_color_label(target):
-            color_label.setText(f"Estimated temperature: {self._rgb_to_kelvin(target)}K")
+            color_label.setText(f"Approx. temperature: {self._warmth_to_kelvin(color_slider.value())}K")
 
         def update_target_from_controls():
             target_rgb[:] = self._warmth_tint_to_rgb(
@@ -1467,9 +2236,10 @@ class PopupPanel(QWidget):
                 self._set_slider_silent("nightlight", preview_strength["value"])
             else:
                 self._safe_restore_nightlight_state(original_target_rgb, current_rgb=original_current_rgb)
-                self._set_slider_silent("nightlight", original_strength)
+                self._set_slider_silent("nightlight", original_strength["value"])
 
         preview_button.toggled.connect(preview_toggled)
+        reset_rgb_button.clicked.connect(reset_rgb_monitor)
         color_slider.sliderReleased.connect(warmth_or_tint_released)
         amber_slider.sliderReleased.connect(warmth_or_tint_released)
         tint_slider.sliderReleased.connect(warmth_or_tint_released)
@@ -1488,9 +2258,10 @@ class PopupPanel(QWidget):
             self.config.set("NIGHTLIGHT_TARGET_TINT", tint_slider.value())
             self.config.set("NIGHTLIGHT_TARGET_RGB", list(target_rgb))
             self.config.set("NIGHTLIGHT_COLOR_CURVE_POINTS", [0, 17, 33, 50, 67, 83, 100])
-            self._safe_set_nightlight_target(target_rgb, apply_current=False)
-            self._safe_set_nightlight_strength(original_strength)
-            self._set_slider_silent("nightlight", original_strength)
+            strength = self.sliders["nightlight"].value()
+            original_strength["value"] = strength
+            self._safe_apply_nightlight_target_and_strength(target_rgb, strength)
+            self._set_slider_silent("nightlight", strength)
 
         apply_button.clicked.connect(remember_target)
         return cancel_button, apply_button, preview_active, original_target_rgb, applied, original_strength, original_current_rgb
@@ -1506,7 +2277,7 @@ class PopupPanel(QWidget):
 
         best_kelvin = 6500
         best_error = float("inf")
-        for kelvin in range(500, 6501, 5):
+        for kelvin in range(1000, 3001, 5):
             sample_r, sample_g, sample_b = self._kelvin_to_rgb(kelvin)
             if sample_r <= 0:
                 continue
@@ -1522,7 +2293,7 @@ class PopupPanel(QWidget):
         return round(best_kelvin, -1)
 
     def _kelvin_to_rgb(self, kelvin):
-        kelvin = max(500, min(40000, float(kelvin))) / 100.0
+        kelvin = max(1000, min(40000, float(kelvin))) / 100.0
         if kelvin <= 66:
             red = 255
             green = 99.4708025861 * math.log(kelvin) - 161.1195681661
@@ -1541,18 +2312,12 @@ class PopupPanel(QWidget):
 
     def _warmth_to_kelvin(self, warmth):
         warmth = max(0.0, min(float(warmth), 100.0)) / 100.0
-        return round(2200 + (700 - 2200) * warmth)
+        return round(3000 + (1000 - 3000) * warmth)
 
     def _warmth_tint_to_rgb(self, color, amber_yellow, tint):
         color = max(0.0, min(float(color), 100.0))
-        color_t = 1.0 - color / 100.0
         target_luma = 0.50
-        dark_rgb = self._scale_rgb_to_luma(self._kelvin_to_rgb(700), target_luma)
-        bright_rgb = self._scale_rgb_to_luma((100.0, 75.3, 29.0), target_luma)
-        rgb = [
-            dark_rgb[channel] + (bright_rgb[channel] - dark_rgb[channel]) * color_t
-            for channel in range(3)
-        ]
+        rgb = self._scale_rgb_to_luma(self._kelvin_to_rgb(self._warmth_to_kelvin(color)), target_luma)
 
         amber_yellow = max(-50, min(50, int(amber_yellow)))
         if amber_yellow < 0:
@@ -1588,7 +2353,7 @@ class PopupPanel(QWidget):
 
     def _rgb_to_warmth(self, rgb):
         kelvin = self._rgb_to_kelvin(rgb)
-        warmth = (2200 - kelvin) / (2200 - 700) * 100
+        warmth = (3000 - kelvin) / (3000 - 1000) * 100
         return round(max(0, min(100, warmth)))
 
     def _apply_nightlight_preview_rgb(self, target_rgb, strength):
@@ -1652,6 +2417,72 @@ class PopupPanel(QWidget):
         if key in self.sliders:
             self.sliders[key].setValue(value)
 
+    def set_source_control(self, source):
+        source = source if source in ("tray", "ambient", "daytime") else "tray"
+        self.active_source = source
+        if hasattr(self, "source_selector"):
+            index = self.source_selector.findData(source)
+            if index >= 0 and self.source_selector.currentIndex() != index:
+                self._updating_source_selector = True
+                self.source_selector.setCurrentIndex(index)
+                self._updating_source_selector = False
+
+    def set_nightlight_source_control(self, source):
+        source = source if source in ("manual", "daytime", "light_linked") else "manual"
+        self.active_nightlight_source = source
+        if hasattr(self, "nightlight_source_selector"):
+            index = self.nightlight_source_selector.findData(source)
+            if index >= 0 and self.nightlight_source_selector.currentIndex() != index:
+                self._updating_nightlight_source_selector = True
+                self.nightlight_source_selector.setCurrentIndex(index)
+                self._updating_nightlight_source_selector = False
+
+    def _source_selector_changed(self, index):
+        if self._updating_source_selector:
+            return
+        source = self.source_selector.itemData(index)
+        if source is None:
+            source = "tray"
+        self.active_source = source
+        if self.on_source_selected is not None:
+            self.on_source_selected(source)
+
+    def _nightlight_source_selector_changed(self, index):
+        if self._updating_nightlight_source_selector:
+            return
+        source = self.nightlight_source_selector.itemData(index)
+        if source is None:
+            source = "manual"
+        self.active_nightlight_source = source
+        if self.on_nightlight_source_selected is not None:
+            self.on_nightlight_source_selected(source)
+
+    def _sync_active_source_sliders(self):
+        if self.active_source == "ambient" and self.ambient_source is not None:
+            status = self.ambient_source.status()
+            light = status.get("light")
+            brightness = status.get("brightness")
+            contrast = status.get("contrast")
+            if light is not None and "light" in self.sliders:
+                self._set_slider_silent("light", light)
+            if brightness is not None:
+                self._set_slider_silent("brightness", brightness)
+            if contrast is not None:
+                self._set_slider_silent("contrast", contrast)
+        elif self.active_source == "daytime":
+            light = getattr(self.config, "LAST_LIGHT", None)
+            brightness = getattr(self.config, "LAST_BRIGHTNESS", None)
+            contrast = getattr(self.config, "LAST_CONTRAST", None)
+            nightlight = getattr(self.config, "LAST_NIGHTLIGHT", None)
+            if light is not None and "light" in self.sliders:
+                self._set_slider_silent("light", light)
+            if brightness is not None:
+                self._set_slider_silent("brightness", brightness)
+            if contrast is not None:
+                self._set_slider_silent("contrast", contrast)
+            if nightlight is not None:
+                self._set_slider_silent("nightlight", nightlight)
+
     def send_debounced(self, key):
         try:
             if key == "light":
@@ -1675,11 +2506,7 @@ class PopupPanel(QWidget):
                 )
             elif key == "nightlight":
                 value = self.sliders['nightlight'].value()
-                submit_ddcci_command(
-                    "nightlight",
-                    "Nightlight strength set",
-                    lambda monitor=self.monitor, value=value: monitor.nightlight_set_strength(value),
-                )
+                self._safe_set_nightlight_strength(value)
             self._remember_slider_values()
         except Exception as e:
             print(f"[WARN] {key} set failed:", e)
@@ -1728,33 +2555,46 @@ def create_tray_icon(
     on_daytime_settings=None,
     on_source_selected=None,
     active_source="tray",
+    on_nightlight_backend_selected=None,
+    active_nightlight_backend=NIGHTLIGHT_BACKEND_DDCCI,
 ):
     tray_icon = QSystemTrayIcon()
     tray_icon.setIcon(QIcon(tray_icon_path()))
     tray_menu = QMenu()
-    source_menu = tray_menu.addMenu("Source control")
-    tray_source_action = QAction("Tray", source_menu)
-    tray_source_action.setCheckable(True)
-    tray_source_action.setChecked(active_source != "daytime")
-    source_menu.addAction(tray_source_action)
-    daytime_source_action = QAction("Daytime", source_menu)
-    daytime_source_action.setCheckable(True)
-    daytime_source_action.setChecked(active_source == "daytime")
-    source_menu.addAction(daytime_source_action)
-    updating_source_actions = {"active": False}
 
-    def select_source(source):
-        if updating_source_actions["active"]:
+    def set_source_actions(source):
+        return
+
+    backend_menu = tray_menu.addMenu("Night Light backend")
+    backend_action_group = QActionGroup(backend_menu)
+    backend_action_group.setExclusive(True)
+    ddcci_backend_action = QAction("DDC/CI RGB", backend_menu)
+    ddcci_backend_action.setCheckable(True)
+    backend_action_group.addAction(ddcci_backend_action)
+    ddcci_backend_action.setChecked(active_nightlight_backend != NIGHTLIGHT_BACKEND_GAMMA)
+    backend_menu.addAction(ddcci_backend_action)
+    gamma_backend_action = QAction("Gamma ramp", backend_menu)
+    gamma_backend_action.setCheckable(True)
+    backend_action_group.addAction(gamma_backend_action)
+    gamma_backend_action.setChecked(active_nightlight_backend == NIGHTLIGHT_BACKEND_GAMMA)
+    backend_menu.addAction(gamma_backend_action)
+    updating_backend_actions = {"active": False}
+
+    def set_backend_actions(backend):
+        updating_backend_actions["active"] = True
+        ddcci_backend_action.setChecked(backend == NIGHTLIGHT_BACKEND_DDCCI)
+        gamma_backend_action.setChecked(backend == NIGHTLIGHT_BACKEND_GAMMA)
+        updating_backend_actions["active"] = False
+
+    def select_backend(backend):
+        if updating_backend_actions["active"]:
             return
-        updating_source_actions["active"] = True
-        tray_source_action.setChecked(source == "tray")
-        daytime_source_action.setChecked(source == "daytime")
-        updating_source_actions["active"] = False
-        if on_source_selected is not None:
-            on_source_selected(source)
+        set_backend_actions(backend)
+        if on_nightlight_backend_selected is not None:
+            on_nightlight_backend_selected(backend)
 
-    tray_source_action.triggered.connect(lambda checked: select_source("tray"))
-    daytime_source_action.triggered.connect(lambda checked: select_source("daytime"))
+    ddcci_backend_action.triggered.connect(lambda checked: select_backend(NIGHTLIGHT_BACKEND_DDCCI))
+    gamma_backend_action.triggered.connect(lambda checked: select_backend(NIGHTLIGHT_BACKEND_GAMMA))
     tray_menu.addSeparator()
     config_action = QAction("Display settings", tray_menu)
     if on_configuration is not None:
@@ -1766,6 +2606,8 @@ def create_tray_icon(
     tray_menu.addAction(quit_action)
     tray_icon.setContextMenu(tray_menu)
     tray_icon.tray_menu = tray_menu
+    tray_icon.set_source_control = set_source_actions
+    tray_icon.set_nightlight_backend = set_backend_actions
     def handle_activation(reason):
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
             QTimer.singleShot(0, on_triggered)

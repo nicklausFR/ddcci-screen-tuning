@@ -4,7 +4,7 @@ import platform
 
 from PySide6.QtWidgets import QApplication
 
-from control_sources import TrayControlSource
+from control_sources import AmbientSensorControlSource, TrayControlSource
 
 
 app = QApplication(sys.argv)
@@ -23,6 +23,7 @@ if platform.system() == "Windows":
 # MIDI control is experimental and not wired into the tested v1.0 startup path.
 
 
-tray_source = TrayControlSource()
+ambient_source = AmbientSensorControlSource()
+tray_source = TrayControlSource(ambient_source=ambient_source)
 tray_icon = tray_source.start()
 sys.exit(app.exec())

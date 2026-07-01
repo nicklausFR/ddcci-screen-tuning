@@ -1,4 +1,11 @@
-from gui import LIGHT_CURVE_POINT_COUNT, CurveEditor, PopupPanel, create_tray_icon
+from gui import (
+    LIGHT_CURVE_POINT_COUNT,
+    NIGHTLIGHT_BACKEND_DDCCI,
+    NIGHTLIGHT_BACKEND_GAMMA,
+    CurveEditor,
+    PopupPanel,
+    create_tray_icon,
+)
 from monitor import DDCCI_Monitor, ddc_ci_monitors_list
 from ddcci_screen_tuning import config
 from ddcci_command_queue import submit_ddcci_command, submit_light_values
@@ -6,41 +13,201 @@ from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QComboBox, QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout
 import datetime
 import math
+import platform
+
+if platform.system() == "Windows":
+    try:
+        from gamma_ramp import apply_strength, reset_gamma
+    except Exception as e:
+        apply_strength = None
+        reset_gamma = None
+        print("[WARN] Windows gamma ramp unavailable:", e)
+else:
+    apply_strength = None
+    reset_gamma = None
 
 
 class TrayControlSource:
-    def __init__(self):
+    def __init__(self, ambient_source=None):
+        self.ambient_source = ambient_source
         self.panel = None
         self.tray_icon = None
         self.daytime_monitor = None
         self.daytime_timer = QTimer()
         self.daytime_timer.timeout.connect(self.apply_daytime)
+        self.auto_nightlight_timer = QTimer()
+        self.auto_nightlight_timer.timeout.connect(self._apply_auto_nightlight)
+        self._last_auto_nightlight = None
 
     def start(self):
         daytime_enabled = bool(getattr(config, "DAYTIME_SOURCE_ENABLED", False))
+        ambient_enabled = bool(getattr(config, "AMBIENT_SOURCE_ENABLED", False))
         self.tray_icon = create_tray_icon(
             self.show_active_source_window,
             self.open_configuration,
             self.open_daytime_settings,
             self.select_source,
-            "daytime" if daytime_enabled else "tray",
+            self._active_source_name(),
+            self.select_nightlight_backend,
+            self._nightlight_backend(),
         )
-        if daytime_enabled:
+        if ambient_enabled and self.ambient_source is not None:
+            self.set_daytime_enabled(False)
+            if not self.ambient_source.start():
+                config.set("AMBIENT_SOURCE_ENABLED", False)
+                self._sync_tray_source_menu("tray")
+                self.apply_tray_values()
+        elif daytime_enabled:
             self.set_daytime_enabled(True)
+        self._update_auto_nightlight_timer()
         return self.tray_icon
 
     def select_source(self, source):
-        if source == "daytime":
-            self.set_daytime_enabled(True)
-        else:
+        if source == "ambient":
             self.set_daytime_enabled(False)
+            if self.ambient_source is not None and self.ambient_source.set_enabled(True):
+                self._sync_tray_source_menu("ambient")
+                self._update_auto_nightlight_timer()
+                return
+            config.set("AMBIENT_SOURCE_ENABLED", False)
+            self._sync_tray_source_menu("tray")
+            self._update_auto_nightlight_timer()
+            self.apply_tray_values()
+        elif source == "daytime":
+            self._set_ambient_enabled(False)
+            self.set_daytime_enabled(True)
+            self._update_auto_nightlight_timer()
+        else:
+            self._set_ambient_enabled(False)
+            self.set_daytime_enabled(False)
+            self._update_auto_nightlight_timer()
             self.apply_tray_values()
 
-    def show_active_source_window(self):
+    def _active_source_name(self):
+        if bool(getattr(config, "AMBIENT_SOURCE_ENABLED", False)):
+            return "ambient"
         if bool(getattr(config, "DAYTIME_SOURCE_ENABLED", False)):
-            self.open_daytime_settings()
+            return "daytime"
+        return "tray"
+
+    def _sync_tray_source_menu(self, source=None):
+        if source is None:
+            source = self._active_source_name()
+        if self.tray_icon is not None and hasattr(self.tray_icon, "set_source_control"):
+            self.tray_icon.set_source_control(source)
+        if self.panel is not None and hasattr(self.panel, "set_source_control"):
+            self.panel.set_source_control(source)
+
+    def _nightlight_source(self):
+        source = str(getattr(config, "NIGHTLIGHT_SOURCE", "manual"))
+        if source not in ("manual", "daytime", "light_linked"):
+            source = "manual"
+        return source
+
+    def select_nightlight_source(self, source):
+        if source not in ("manual", "daytime", "light_linked"):
+            source = "manual"
+        config.set("NIGHTLIGHT_SOURCE", source)
+        self._sync_panel_nightlight_source_menu(source)
+        self._last_auto_nightlight = None
+        self._update_auto_nightlight_timer()
+        if self._active_source_name() == "daytime":
+            self.apply_daytime()
+        elif self._active_source_name() == "ambient":
+            self._apply_auto_nightlight()
         else:
-            self.show_panel()
+            self.apply_tray_values()
+
+    def _sync_panel_nightlight_source_menu(self, source=None):
+        if source is None:
+            source = self._nightlight_source()
+        if self.panel is not None and hasattr(self.panel, "set_nightlight_source_control"):
+            self.panel.set_nightlight_source_control(source)
+
+    def _update_auto_nightlight_timer(self):
+        if self._active_source_name() != "daytime" and self._nightlight_source() != "manual":
+            self.auto_nightlight_timer.start(500)
+        else:
+            self.auto_nightlight_timer.stop()
+
+    def _set_ambient_enabled(self, enabled):
+        if self.ambient_source is not None:
+            self.ambient_source.set_enabled(enabled)
+        else:
+            config.set("AMBIENT_SOURCE_ENABLED", bool(enabled))
+
+    def select_nightlight_backend(self, backend):
+        if backend not in (NIGHTLIGHT_BACKEND_DDCCI, NIGHTLIGHT_BACKEND_GAMMA):
+            backend = NIGHTLIGHT_BACKEND_DDCCI
+        self._sync_tray_nightlight_backend_menu(backend)
+        if self.panel is not None and self.panel.isVisible():
+            self.panel._set_nightlight_backend(backend)
+            return
+        self.panel = None
+        previous_backend = self._nightlight_backend()
+        config.set("NIGHTLIGHT_BACKEND", backend)
+        if previous_backend == NIGHTLIGHT_BACKEND_GAMMA and backend != NIGHTLIGHT_BACKEND_GAMMA and reset_gamma is not None:
+            try:
+                reset_gamma()
+            except Exception as e:
+                print("[WARN] Gamma ramp reset failed:", e)
+        if previous_backend != NIGHTLIGHT_BACKEND_GAMMA and backend == NIGHTLIGHT_BACKEND_GAMMA and self.panel is None:
+            try:
+                monitor = self._monitor_for_daytime()
+                submit_ddcci_command(
+                    "nightlight",
+                    "Nightlight RGB off",
+                    lambda monitor=monitor: monitor.nightlight_set_strength(0),
+                )
+            except Exception as e:
+                print("[WARN] Failed to turn off DDC/CI RGB Night Light:", e)
+        if bool(getattr(config, "DAYTIME_SOURCE_ENABLED", False)):
+            self.apply_daytime()
+        else:
+            self.apply_tray_values()
+
+    def _sync_tray_nightlight_backend_menu(self, backend=None):
+        if backend is None:
+            backend = self._nightlight_backend()
+        if self.tray_icon is not None and hasattr(self.tray_icon, "set_nightlight_backend"):
+            self.tray_icon.set_nightlight_backend(backend)
+
+    def _nightlight_backend(self):
+        backend = str(getattr(config, "NIGHTLIGHT_BACKEND", NIGHTLIGHT_BACKEND_DDCCI))
+        if backend == NIGHTLIGHT_BACKEND_GAMMA:
+            return NIGHTLIGHT_BACKEND_GAMMA
+        return NIGHTLIGHT_BACKEND_DDCCI
+
+    def _gamma_warm_kelvin(self):
+        try:
+            kelvin = int(getattr(config, "GAMMA_RAMP_WARM_KELVIN", 5000))
+        except (TypeError, ValueError):
+            kelvin = 5000
+        return max(1000, min(5000, kelvin))
+
+    def _apply_gamma_nightlight(self, strength):
+        if apply_strength is None or reset_gamma is None:
+            print("[WARN] Gamma ramp backend unavailable on this system.")
+            return False
+        strength = max(0, min(100, int(strength)))
+        if strength <= 0:
+            reset_gamma()
+        else:
+            apply_strength(self._gamma_warm_kelvin(), strength)
+        return True
+
+    def _apply_nightlight(self, monitor, value, label):
+        if self._nightlight_backend() == NIGHTLIGHT_BACKEND_GAMMA:
+            self._apply_gamma_nightlight(value)
+            return
+        submit_ddcci_command(
+            "nightlight",
+            label,
+            lambda monitor=monitor, value=value: monitor.nightlight_set_strength(value),
+        )
+
+    def show_active_source_window(self):
+        self.show_panel()
 
     def selected_monitor_index(self, monitors):
         if not monitors:
@@ -57,7 +224,17 @@ class TrayControlSource:
                 monitor_names = ddc_ci_monitors_list()
                 index = self.selected_monitor_index(monitor_names)
                 monitor = DDCCI_Monitor(index=index)
-                self.panel = PopupPanel(monitor, monitor_names, index)
+                self.panel = PopupPanel(
+                    monitor,
+                    monitor_names,
+                    index,
+                    on_nightlight_backend_changed=self._sync_tray_nightlight_backend_menu,
+                    ambient_source=self.ambient_source,
+                    on_source_selected=self.select_source,
+                    active_source=self._active_source_name(),
+                    on_nightlight_source_selected=self.select_nightlight_source,
+                    active_nightlight_source=self._nightlight_source(),
+                )
             except Exception as e:
                 print("[WARN] Failed to open panel:", e)
                 return None
@@ -82,11 +259,13 @@ class TrayControlSource:
         panel.show()
         panel.raise_()
         panel.activateWindow()
-        panel.open_display_settings()
+        initial_tab = "ambient" if bool(getattr(config, "AMBIENT_SOURCE_ENABLED", False)) else None
+        panel.open_display_settings(initial_tab=initial_tab)
 
     def set_daytime_enabled(self, enabled):
         config.set("DAYTIME_SOURCE_ENABLED", bool(enabled))
         if enabled:
+            config.set("AMBIENT_SOURCE_ENABLED", False)
             self.apply_daytime()
             interval = int(float(getattr(config, "DAYTIME_UPDATE_SECONDS", 300)) * 1000)
             self.daytime_timer.start(max(10000, interval))
@@ -103,29 +282,21 @@ class TrayControlSource:
         try:
             brightness = max(0, min(100, int(getattr(config, "TRAY_BRIGHTNESS", getattr(config, "LAST_BRIGHTNESS", 49)))))
             contrast = max(0, min(100, int(getattr(config, "TRAY_CONTRAST", getattr(config, "LAST_CONTRAST", 49)))))
-            nightlight = max(0, min(100, int(getattr(config, "TRAY_NIGHTLIGHT", getattr(config, "LAST_NIGHTLIGHT", 0)))))
+            light = getattr(config, "TRAY_LIGHT", getattr(config, "LAST_LIGHT", 50))
+            nightlight = self._nightlight_value_for_source(light)
 
             if self.panel is not None and self.panel.isVisible():
                 self.panel._set_slider_silent("brightness", brightness)
                 self.panel._set_slider_silent("contrast", contrast)
                 self.panel._set_slider_silent("nightlight", nightlight)
                 if self.panel.light_mode:
-                    light = getattr(config, "TRAY_LIGHT", getattr(config, "LAST_LIGHT", self.panel._brightness_to_light(brightness)))
                     self.panel._set_slider_silent("light", light)
                 submit_light_values(self.panel.monitor, brightness, contrast, "Tray light")
-                submit_ddcci_command(
-                    "nightlight",
-                    "Tray nightlight",
-                    lambda monitor=self.panel.monitor, value=nightlight: monitor.nightlight_set_strength(value),
-                )
+                self.panel._safe_set_nightlight_strength(nightlight)
             else:
                 monitor = self._monitor_for_daytime()
                 submit_light_values(monitor, brightness, contrast, "Tray light")
-                submit_ddcci_command(
-                    "nightlight",
-                    "Tray nightlight",
-                    lambda monitor=monitor, value=nightlight: monitor.nightlight_set_strength(value),
-                )
+                self._apply_nightlight(monitor, nightlight, "Tray nightlight")
             config.set("LAST_BRIGHTNESS", brightness)
             config.set("LAST_CONTRAST", contrast)
             config.set("LAST_NIGHTLIGHT", nightlight)
@@ -154,6 +325,54 @@ class TrayControlSource:
             [70, 50, 18, 0, 18, 50, 70],
         )
         return round(self._curve_value(curve, daytime_position))
+
+    def _light_linked_nightlight_value(self, light=None):
+        if light is None:
+            light = getattr(config, "LAST_LIGHT", getattr(config, "TRAY_LIGHT", 50))
+        curve = self._curve_points(
+            "LIGHT_NIGHTLIGHT_CURVE_POINTS",
+            [80, 65, 45, 25, 12, 4, 0],
+        )
+        return max(0, min(100, round(self._curve_value(curve, light))))
+
+    def _nightlight_value_for_source(self, light=None):
+        source = self._nightlight_source()
+        if source == "daytime":
+            return self._daytime_color_value()
+        if source == "light_linked":
+            return self._light_linked_nightlight_value(light)
+        return max(0, min(100, int(getattr(config, "TRAY_NIGHTLIGHT", getattr(config, "LAST_NIGHTLIGHT", 0)))))
+
+    def _current_light_value(self):
+        if self._active_source_name() == "ambient" and self.ambient_source is not None:
+            status = self.ambient_source.status()
+            light = status.get("light")
+            if light is not None:
+                return light
+        if self.panel is not None and self.panel.isVisible() and "light" in getattr(self.panel, "sliders", {}):
+            return self.panel.sliders["light"].value()
+        if self._active_source_name() == "daytime":
+            return self._daytime_light_value()
+        return getattr(config, "TRAY_LIGHT", getattr(config, "LAST_LIGHT", 50))
+
+    def _apply_auto_nightlight(self):
+        if self._nightlight_source() == "manual":
+            return
+        light = self._current_light_value()
+        nightlight = self._nightlight_value_for_source(light)
+        if self._last_auto_nightlight == nightlight:
+            return
+        try:
+            if self.panel is not None and self.panel.isVisible():
+                self.panel._set_slider_silent("nightlight", nightlight)
+                self.panel._safe_set_nightlight_strength(nightlight)
+            else:
+                monitor = self._monitor_for_daytime()
+                self._apply_nightlight(monitor, nightlight, "Auto nightlight")
+            config.set("LAST_NIGHTLIGHT", nightlight)
+            self._last_auto_nightlight = nightlight
+        except Exception as e:
+            print("[WARN] Auto Nightlight failed:", e)
 
     def _config_rgb(self, name, default):
         value = getattr(config, name, default)
@@ -271,26 +490,18 @@ class TrayControlSource:
         if not bool(getattr(config, "LIGHT_MODE", False)):
             return
         light = self._daytime_light_value()
-        color = self._daytime_color_value()
+        color = self._nightlight_value_for_source(light)
         try:
             if self.panel is not None and self.panel.isVisible():
                 self.panel.apply_light_value(light)
                 self.panel._set_slider_silent("nightlight", color)
-                submit_ddcci_command(
-                    "nightlight",
-                    "Daytime nightlight",
-                    lambda monitor=self.panel.monitor, value=color: monitor.nightlight_set_strength(value),
-                )
+                self.panel._safe_set_nightlight_strength(color)
                 self.panel._remember_slider_values()
             else:
                 monitor = self._monitor_for_daytime()
                 brightness, contrast = self._light_to_brightness_contrast(light)
                 submit_light_values(monitor, brightness, contrast, "Daytime light")
-                submit_ddcci_command(
-                    "nightlight",
-                    "Daytime nightlight",
-                    lambda monitor=monitor, value=color: monitor.nightlight_set_strength(value),
-                )
+                self._apply_nightlight(monitor, color, "Daytime nightlight")
                 config.set("LAST_LIGHT", light)
                 config.set("LAST_BRIGHTNESS", brightness)
                 config.set("LAST_CONTRAST", contrast)
