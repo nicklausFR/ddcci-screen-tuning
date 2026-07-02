@@ -8,6 +8,8 @@ GAMMA_POINTS = 256
 MAX_GAMMA_VALUE = 65535
 DEFAULT_WHITE_KELVIN = 6500
 DEFAULT_WARM_KELVIN = 1900
+LUMA_WEIGHTS = (0.2126, 0.7152, 0.0722)
+SAFE_MAX_GAMMA_STRENGTH = 95.0
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
@@ -88,9 +90,41 @@ def _make_ramp(red_gamma=1.0, green_gamma=1.0, blue_gamma=1.0, scales=(1.0, 1.0,
     return ramp
 
 
-def _make_kelvin_ramp(kelvin, brightness=100, scale_max=False):
+def _relative_luma(channels):
+    return sum(channel * weight for channel, weight in zip(channels, LUMA_WEIGHTS))
+
+
+def _luma_compensated_scales(channel_scales):
+    channel_scales = tuple(_clamp(float(scale), 0.0, 1.0) for scale in channel_scales)
+    luma = _relative_luma(channel_scales)
+    scale = 1.0 / luma if luma > 0 else 1.0
+    return tuple(_clamp(channel * scale, 0.0, 1.0) for channel in channel_scales)
+
+
+def _make_luma_preserving_ramp(channel_scales, brightness=1.0):
+    ramp = (ctypes.c_ushort * (GAMMA_POINTS * 3))()
+    target_scales = _luma_compensated_scales(channel_scales)
+    brightness = _clamp(float(brightness), 0.01, 1.0)
+
+    for i in range(GAMMA_POINTS):
+        x = i / (GAMMA_POINTS - 1)
+        highlight_restore = x ** 4
+        channels = [
+            x * brightness * (scale * (1.0 - highlight_restore) + highlight_restore)
+            for scale in target_scales
+        ]
+        for channel, value in enumerate(channels):
+            ramp[channel * GAMMA_POINTS + i] = round(_clamp(value, 0.0, 1.0) * MAX_GAMMA_VALUE)
+
+    return ramp
+
+
+def _make_kelvin_ramp(kelvin, brightness=100, scale_max=False, preserve_luma=True):
     brightness = _clamp(float(brightness), 1.0, 100.0) / 100.0
     channel_scales = _kelvin_to_channel_scales(kelvin)
+
+    if preserve_luma:
+        return _make_luma_preserving_ramp(channel_scales, brightness)
 
     if scale_max:
         scales = tuple(scale * brightness for scale in channel_scales)
@@ -121,19 +155,33 @@ def reset_gamma():
     _set_ramp(_make_ramp())
 
 
-def apply_kelvin(kelvin, brightness=100, scale_max=False):
-    _set_ramp(_make_kelvin_ramp(kelvin, brightness, scale_max))
+def apply_kelvin(kelvin, brightness=100, scale_max=False, preserve_luma=True):
+    _set_ramp(_make_kelvin_ramp(kelvin, brightness, scale_max, preserve_luma))
 
 
-def apply_strength(kelvin, strength, brightness=100, scale_max=False):
-    strength = _clamp(float(strength), 0.0, 100.0) / 100.0
-    if strength <= 0:
+def apply_strength(kelvin, strength, brightness=100, scale_max=False, preserve_luma=True):
+    requested_strength = _clamp(float(strength), 0.0, 100.0)
+    if requested_strength <= 0:
         reset_gamma()
         return
 
+    effective_strength = min(requested_strength, SAFE_MAX_GAMMA_STRENGTH)
     neutral = _make_ramp()
-    target = _make_kelvin_ramp(kelvin, brightness, scale_max)
-    _set_ramp(_blend_ramps(neutral, target, strength))
+    target = _make_kelvin_ramp(kelvin, brightness, scale_max, preserve_luma)
+    last_error = None
+    retry_strengths = [effective_strength]
+    retry_strengths.extend(
+        value
+        for value in range(int(effective_strength) - 5, 0, -5)
+        if value not in retry_strengths
+    )
+    for retry_strength in retry_strengths:
+        try:
+            _set_ramp(_blend_ramps(neutral, target, retry_strength / 100.0))
+            return
+        except GammaRampError as exc:
+            last_error = exc
+    raise last_error
 
 
 def apply_warmth(strength):

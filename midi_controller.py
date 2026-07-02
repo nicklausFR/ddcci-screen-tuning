@@ -100,6 +100,54 @@ class MidiController:
         raw = max(0, min(127, raw))
         return int((raw / 127) * 100)
 
+    def _auto_curve_active(self):
+        return bool(getattr(config, "LIGHT_MODE", False)) and not bool(getattr(config, "DETAIL_ROWS_VISIBLE", True))
+
+    def _curve_points(self, name, fallback):
+        points = getattr(config, name, None)
+        if not isinstance(points, (list, tuple)) or len(points) != 7:
+            return fallback
+        try:
+            return [max(0, min(100, int(point))) for point in points]
+        except (TypeError, ValueError):
+            return fallback
+
+    def _curve_value(self, points, x):
+        values = [float(point) for point in points]
+        t = max(0.0, min(float(x), 100.0)) / 100.0
+        while len(values) > 1:
+            values = [
+                values[index] + (values[index + 1] - values[index]) * t
+                for index in range(len(values) - 1)
+            ]
+        return values[0]
+
+    def _config_range(self, name, default):
+        value = getattr(config, name, default)
+        if not isinstance(value, (list, tuple)) or len(value) != 2:
+            return default
+        try:
+            return float(value[0]), float(value[1])
+        except (TypeError, ValueError):
+            return default
+
+    def _light_to_brightness_contrast(self, value):
+        brightness_points = self._curve_points(
+            "LIGHT_BRIGHTNESS_CURVE_POINTS",
+            [0, 34, 55, 68, 78, 88, 100],
+        )
+        contrast_points = self._curve_points(
+            "LIGHT_CONTRAST_CURVE_POINTS",
+            [0, 18, 31, 42, 55, 74, 100],
+        )
+        brightness_y = self._curve_value(brightness_points, value) / 100.0
+        contrast_y = self._curve_value(contrast_points, value) / 100.0
+        b_min, b_max = self._config_range("LIGHT_BRIGHTNESS_RANGE", (0, 100))
+        c_min, c_max = self._config_range("LIGHT_CONTRAST_RANGE", (35, 100))
+        brightness = b_min + (b_max - b_min) * brightness_y
+        contrast = c_min + (c_max - c_min) * contrast_y
+        return round(brightness), round(contrast)
+
     def _handle_control(self, channel, value):
         mapping = {
             config.MidiBrightnessChannel: ("brightness", self.monitor.set_brightness),
@@ -113,8 +161,14 @@ class MidiController:
 
             def apply():
                 try:
-                    action(value)
-                    bus.midi_update.emit(key, value)
+                    emit_key = key
+                    if key == "brightness" and self._auto_curve_active():
+                        brightness, contrast = self._light_to_brightness_contrast(value)
+                        self.monitor.set_light_values(brightness, contrast)
+                        emit_key = "light"
+                    else:
+                        action(value)
+                    bus.midi_update.emit(emit_key, value)
                 except Exception as e:
                     print(f"[MIDI_ACTION] Channel {channel} error: {e}")
 

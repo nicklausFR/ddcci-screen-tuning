@@ -1,10 +1,12 @@
-from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QSlider, QLabel, QPushButton, QComboBox, QSystemTrayIcon, QMenu, QDialog, QTabWidget, QLineEdit)
+from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QSlider, QLabel, QPushButton, QComboBox, QSystemTrayIcon, QMenu, QDialog, QLineEdit, QListWidget, QListWidgetItem, QStackedWidget, QTabWidget)
 from PySide6.QtGui import QIcon, QFont, QAction, QActionGroup, QColor, QPainter, QPen, QBrush, QPalette, QCursor
 from PySide6.QtCore import Qt, QSize, QTimer, Signal
 from monitor import DDCCI_Monitor
 from ddcci_screen_tuning import PresetManager, config
 from ddcci_command_queue import submit_ddcci_command, submit_light_values
+from daytime import daytime_position, format_hour, parse_hour, solar_hours
 import sys
+import datetime
 import math
 import platform
 import time
@@ -26,6 +28,116 @@ LIGHT_CURVE_POINT_COUNT = 7
 NIGHTLIGHT_BACKEND_DDCCI = "ddcci_rgb"
 NIGHTLIGHT_BACKEND_GAMMA = "gamma_ramp"
 
+# Countries are split only when the mainland span is roughly above this
+# threshold north-south or east-west. Smaller countries keep one entry.
+DAYTIME_LOCATION_SPLIT_THRESHOLD_KM = 1500
+DAYTIME_LOCATION_PRESETS = {
+    "Algeria - North": (36.8, 3.1),
+    "Algeria - South": (23.3, 5.4),
+    "Argentina - Central": (-34.6, -58.4),
+    "Argentina - North": (-24.8, -65.4),
+    "Argentina - South": (-51.6, -69.2),
+    "Australia - East": (-33.9, 151.2),
+    "Australia - South-East": (-37.8, 144.9),
+    "Australia - West": (-31.9, 115.9),
+    "Austria": (48.2, 16.4),
+    "Bangladesh": (23.8, 90.4),
+    "Belgium": (50.8, 4.4),
+    "Bolivia": (-16.5, -68.1),
+    "Brazil - North": (-3.1, -60.0),
+    "Brazil - South-East": (-23.5, -46.6),
+    "Brazil - South": (-30.0, -51.2),
+    "Bulgaria": (42.7, 23.3),
+    "Canada - Central": (49.9, -97.1),
+    "Canada - East": (45.5, -73.6),
+    "Canada - West": (49.3, -123.1),
+    "Chile - Central": (-33.4, -70.7),
+    "Chile - North": (-23.7, -70.4),
+    "Chile - South": (-41.5, -72.9),
+    "China - East": (31.2, 121.5),
+    "China - North": (39.9, 116.4),
+    "China - South": (23.1, 113.3),
+    "China - West": (30.6, 104.1),
+    "Colombia": (4.7, -74.1),
+    "Costa Rica": (9.9, -84.1),
+    "Croatia": (45.8, 16.0),
+    "Czechia": (50.1, 14.4),
+    "Denmark": (55.7, 12.6),
+    "Egypt": (30.0, 31.2),
+    "Estonia": (59.4, 24.8),
+    "Finland": (60.2, 24.9),
+    "France": (46.6, 2.4),
+    "Germany": (51.2, 10.4),
+    "Greece": (37.98, 23.73),
+    "Hungary": (47.5, 19.0),
+    "Iceland": (64.1, -21.9),
+    "India - North": (28.6, 77.2),
+    "India - South": (12.9, 77.6),
+    "India - West": (19.1, 72.9),
+    "Indonesia - Central": (-5.1, 119.4),
+    "Indonesia - East": (-2.5, 140.7),
+    "Indonesia - West": (-6.2, 106.8),
+    "Ireland": (53.3, -6.3),
+    "Israel": (31.8, 35.2),
+    "Italy": (41.9, 12.5),
+    "Japan - North": (43.1, 141.4),
+    "Japan - South": (34.7, 135.5),
+    "Kenya": (-1.3, 36.8),
+    "Latvia": (56.9, 24.1),
+    "Lithuania": (54.7, 25.3),
+    "Luxembourg": (49.6, 6.1),
+    "Malaysia": (3.1, 101.7),
+    "Mexico - Central": (19.4, -99.1),
+    "Mexico - North": (25.7, -100.3),
+    "Mexico - South": (16.8, -93.1),
+    "Morocco": (34.0, -6.8),
+    "Netherlands": (52.4, 4.9),
+    "New Zealand - North": (-36.8, 174.8),
+    "New Zealand - South": (-43.5, 172.6),
+    "Nigeria": (6.5, 3.4),
+    "Norway - North": (69.6, 18.9),
+    "Norway - South": (59.9, 10.8),
+    "Pakistan - North": (33.7, 73.1),
+    "Pakistan - South": (24.9, 67.0),
+    "Peru - North": (-6.8, -79.8),
+    "Peru - South": (-16.4, -71.5),
+    "Philippines - North": (14.6, 121.0),
+    "Philippines - South": (7.1, 125.6),
+    "Poland": (52.2, 21.0),
+    "Portugal": (38.7, -9.1),
+    "Romania": (44.4, 26.1),
+    "Russia - West": (55.8, 37.6),
+    "Russia - Central": (56.0, 92.9),
+    "Russia - East": (43.1, 131.9),
+    "Saudi Arabia - East": (26.4, 50.1),
+    "Saudi Arabia - West": (21.5, 39.2),
+    "Serbia": (44.8, 20.5),
+    "Singapore": (1.35, 103.8),
+    "Slovakia": (48.1, 17.1),
+    "Slovenia": (46.1, 14.5),
+    "South Africa - East": (-26.2, 28.0),
+    "South Africa - West": (-33.9, 18.4),
+    "South Korea": (37.6, 127.0),
+    "Spain": (40.4, -3.7),
+    "Sweden - North": (65.6, 22.2),
+    "Sweden - South": (59.3, 18.1),
+    "Switzerland": (46.9, 8.2),
+    "Thailand": (13.8, 100.5),
+    "Tunisia": (36.8, 10.2),
+    "Turkey - East": (39.9, 41.3),
+    "Turkey - West": (41.0, 29.0),
+    "Ukraine": (50.5, 30.5),
+    "United Arab Emirates": (25.2, 55.3),
+    "United Kingdom": (52.4, -1.5),
+    "United States - Central": (41.9, -87.6),
+    "United States - East": (40.7, -74.0),
+    "United States - West-Central": (39.7, -105.0),
+    "United States - West": (37.8, -122.4),
+    "Uruguay": (-34.9, -56.2),
+    "Vietnam - North": (21.0, 105.8),
+    "Vietnam - South": (10.8, 106.7),
+}
+
 
 class AmbientLuxGraph(QWidget):
     thresholds_changed = Signal(float, float)
@@ -44,12 +156,32 @@ class AmbientLuxGraph(QWidget):
         self._y_min_log = -1.0
         self._y_max_log = 3.0
         self._min_positive = 0.05
+        self._threshold_edits = {}
         self.setMinimumHeight(235)
         self.setMouseTracking(True)
+
+    def _format_lux(self, value):
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return "-"
+        if value >= 100:
+            return f"{value:.0f} lx"
+        if value >= 10:
+            return f"{value:.1f} lx"
+        return f"{value:.2f} lx"
 
     def set_thresholds(self, lux_zero, lux_full):
         self.lux_zero = max(0.001, float(lux_zero))
         self.lux_full = max(self.lux_zero + 0.001, float(lux_full))
+        self.update()
+
+    def set_threshold_edits(self, min_edit, max_edit):
+        self._threshold_edits = {"zero": min_edit, "full": max_edit}
+        for edit in self._threshold_edits.values():
+            edit.setParent(self)
+            edit.raise_()
+            edit.show()
         self.update()
 
     def add_sample(self, lux, filtered_lux=None, saturated=False):
@@ -73,7 +205,7 @@ class AmbientLuxGraph(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        rect = self.rect().adjusted(52, 14, -58, -28)
+        rect = self.rect().adjusted(28, 14, -122, -28)
         painter.fillRect(self.rect(), QColor("#202020"))
         painter.setPen(QPen(QColor("#555"), 1))
         painter.drawRect(rect)
@@ -110,20 +242,34 @@ class AmbientLuxGraph(QWidget):
             log_value = math.log10(max(min_positive, value))
             return rect.bottom() - (log_value - y_min) / (y_max - y_min) * rect.height()
 
+        decade_min = math.floor(y_min)
+        decade_max = math.ceil(y_max)
+        for exponent in range(decade_min, decade_max + 1):
+            for multiplier in range(1, 10):
+                value = multiplier * (10 ** exponent)
+                y = y_for(value)
+                if rect.top() <= y <= rect.bottom():
+                    color = QColor("#505050") if multiplier == 1 else QColor("#333333")
+                    painter.setPen(QPen(color, 1))
+                    painter.drawLine(rect.left(), round(y), rect.right(), round(y))
+                    if multiplier == 1:
+                        painter.setPen(QPen(QColor("#8a8a8a"), 1))
+                        painter.drawText(0, round(y) - 6, 24, 12, Qt.AlignRight | Qt.AlignVCenter, self._format_lux(value).replace(" lx", ""))
+
         for value, text, color in (
-            (self.lux_zero, "Lux 0%", QColor("#64b5f6")),
-            (self.lux_full, "Lux 100%", QColor("#ffb74d")),
+            (self.lux_zero, "min", QColor("#64b5f6")),
+            (self.lux_full, "max", QColor("#ffb74d")),
         ):
             y = y_for(value)
             painter.setPen(QPen(color, 1, Qt.DashLine))
             painter.drawLine(rect.left(), round(y), rect.right(), round(y))
             painter.drawText(rect.right() + 6, round(y) + 4, text)
 
+        self._position_threshold_edits(y_for)
+
         painter.setPen(QPen(QColor("#aaa"), 1))
         painter.drawText(rect.left(), self.height() - 8, "10s")
         painter.drawText(rect.right() - 24, self.height() - 8, "now")
-        painter.drawText(4, rect.top() + 8, f"{10 ** y_max:.0f}")
-        painter.drawText(4, rect.bottom(), f"{10 ** y_min:.1f}")
 
         if len(visible_samples) < 2:
             painter.setPen(QPen(QColor("#888"), 1))
@@ -149,11 +295,23 @@ class AmbientLuxGraph(QWidget):
                     painter.drawLine(previous[0], previous[1], point[0], point[1])
                 previous = point
         if self.current_lux is not None:
-            measured_y = round(y_for(self.current_filtered_lux if self.current_filtered_lux is not None else self.current_lux))
+            measured_value = self.current_filtered_lux if self.current_filtered_lux is not None else self.current_lux
+            measured_y = round(y_for(measured_value))
             measured_y = max(rect.top() + 10, min(rect.bottom() - 4, measured_y))
             painter.setPen(QPen(QColor("#7fd36b" if self.current_filtered_lux is not None else "#d8d8d8"), 1))
-            painter.drawText(4, measured_y + 4, f"{self.current_lux:.2f}")
+            painter.drawText(rect.right() + 6, measured_y + 4, self._format_lux(self.current_lux))
         painter.end()
+
+    def _position_threshold_edits(self, y_for):
+        if not self._threshold_edits:
+            return
+        for key, value in (("zero", self.lux_zero), ("full", self.lux_full)):
+            edit = self._threshold_edits.get(key)
+            if edit is None:
+                continue
+            y = round(y_for(value))
+            y = max(18, min(self.height() - 42, y - 11))
+            edit.setGeometry(self._plot_rect.right() + 34, y, 72, 22)
 
     def _y_for_lux(self, value):
         if self._plot_rect is None:
@@ -217,6 +375,24 @@ class AmbientLuxGraph(QWidget):
         self.update()
 
 
+class LinkBracket(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, False)
+        painter.setPen(QPen(QColor("#9a9a9a"), 1))
+        x = 1
+        top = 0
+        bottom = self.height() - 1
+        painter.drawLine(x, top, x, bottom)
+        painter.drawLine(x, top, self.width() - 1, top)
+        painter.drawLine(x, bottom, self.width() - 1, bottom)
+        painter.end()
+
+
 def _windows_uses_light_taskbar():
     if platform.system() != "Windows":
         return None
@@ -263,6 +439,8 @@ class CurveEditor(QWidget):
         current_x=None,
         current_y=None,
         preview_x=None,
+        x_display_exponent=1.0,
+        x_tick_labels=None,
     ):
         super().__init__()
         self.y_min = int(y_min)
@@ -280,6 +458,11 @@ class CurveEditor(QWidget):
         self.current_x = current_x
         self.current_y = current_y
         self.preview_x = preview_x
+        try:
+            self.x_display_exponent = max(0.1, float(x_display_exponent))
+        except (TypeError, ValueError):
+            self.x_display_exponent = 1.0
+        self.x_tick_labels = x_tick_labels
         self.active_index = None
         self.preview_dragging = False
         self.hover_index = None
@@ -299,9 +482,18 @@ class CurveEditor(QWidget):
         for i in range(6):
             y = rect.top() + rect.height() * i / 5
             painter.drawLine(rect.left(), round(y), rect.right(), round(y))
-        for i in range(5):
-            x = rect.left() + rect.width() * i / 4
-            painter.drawLine(round(x), rect.top(), round(x), rect.bottom())
+        if self.x_tick_labels:
+            grid_values = [0, 1, 2, 3, 5, 7, 10, 15, 20, 30, 40, 50, 70, 85, 100]
+            for value in grid_values:
+                x = self._x_for_value(rect, value)
+                color = QColor(75, 75, 75) if value in self.x_tick_labels else QColor(50, 50, 50)
+                painter.setPen(QPen(color, 1))
+                painter.drawLine(round(x), rect.top(), round(x), rect.bottom())
+        else:
+            painter.setPen(grid_pen)
+            for i in range(5):
+                x = rect.left() + rect.width() * i / 4
+                painter.drawLine(round(x), rect.top(), round(x), rect.bottom())
 
         painter.setPen(QPen(QColor(185, 185, 185), 1))
         font = painter.font()
@@ -312,9 +504,15 @@ class CurveEditor(QWidget):
             y = self._y_for_value(rect, value)
             label = self.y_tick_labels.get(value, str(value))
             painter.drawText(2, round(y) - 6, 30, 12, Qt.AlignRight | Qt.AlignVCenter, label)
-        for index, label in enumerate(self.x_labels):
-            x = rect.left() + rect.width() * index / (len(self.x_labels) - 1)
-            painter.drawText(round(x) - 28, rect.bottom() + 6, 56, 14, Qt.AlignCenter, label)
+        if self.x_tick_labels:
+            for value, label in self.x_tick_labels.items():
+                x = self._x_for_value(rect, value)
+                painter.drawText(round(x) - 28, rect.bottom() + 6, 56, 14, Qt.AlignCenter, label)
+        else:
+            for index, label in enumerate(self.x_labels):
+                value = 100 * index / (len(self.x_labels) - 1)
+                x = self._x_for_value(rect, value)
+                painter.drawText(round(x) - 28, rect.bottom() + 6, 56, 14, Qt.AlignCenter, label)
         painter.drawText(rect.left(), 2, rect.width(), 14, Qt.AlignCenter, self.y_label)
 
         curve_points = self._screen_points()
@@ -323,7 +521,7 @@ class CurveEditor(QWidget):
         sampled_curve = []
         for i in range(101):
             x = rect.left() + rect.width() * i / 100
-            y = self._y_for_value(rect, self._interpolated_value(i))
+            y = self._y_for_value(rect, self._interpolated_value(self._value_for_x_ratio(i / 100.0)))
             sampled_curve.append((round(x), round(y)))
         for left, right in zip(sampled_curve, sampled_curve[1:]):
             painter.drawLine(left[0], left[1], right[0], right[1])
@@ -331,7 +529,7 @@ class CurveEditor(QWidget):
         if self.current_x is not None and self.current_y is not None:
             current_x = max(0.0, min(float(self.current_x), 100.0))
             current_y = self._clamp_value(self.current_y)
-            x = rect.left() + rect.width() * current_x / 100
+            x = self._x_for_value(rect, current_x)
             y = self._y_for_value(rect, current_y)
             painter.setPen(QPen(QColor(255, 209, 102), 1, Qt.DashLine))
             painter.drawLine(round(x), rect.top(), round(x), rect.bottom())
@@ -341,7 +539,7 @@ class CurveEditor(QWidget):
 
         if self.preview_x is not None:
             preview_x = max(0.0, min(float(self.preview_x), 100.0))
-            x = rect.left() + rect.width() * preview_x / 100
+            x = self._x_for_value(rect, preview_x)
             painter.setPen(QPen(QColor(255, 209, 102), 2))
             painter.drawLine(round(x), rect.top(), round(x), rect.bottom())
 
@@ -359,7 +557,8 @@ class CurveEditor(QWidget):
         rect = self.rect().adjusted(34, 18, -14, -34)
         points = []
         for i, value in enumerate(self.points):
-            x = rect.left() + rect.width() * i / (len(self.points) - 1)
+            logical_x = 100 * i / (len(self.points) - 1)
+            x = self._x_for_value(rect, logical_x)
             y = self._y_for_value(rect, value)
             points.append((round(x), round(y)))
         return points
@@ -378,11 +577,24 @@ class CurveEditor(QWidget):
             ]
         return values[0]
 
+    def _x_ratio_for_value(self, value):
+        value = max(0.0, min(float(value), 100.0)) / 100.0
+        return value ** self.x_display_exponent
+
+    def _value_for_x_ratio(self, ratio):
+        ratio = max(0.0, min(float(ratio), 1.0))
+        return 100.0 * (ratio ** (1.0 / self.x_display_exponent))
+
+    def _x_for_value(self, rect, value):
+        return rect.left() + rect.width() * self._x_ratio_for_value(value)
+
     def _index_for_x(self, x):
         rect = self.rect().adjusted(34, 18, -14, -34)
         if rect.width() <= 0:
             return 0
-        index = round((x - rect.left()) / rect.width() * (len(self.points) - 1))
+        ratio = (x - rect.left()) / rect.width()
+        logical_x = self._value_for_x_ratio(ratio)
+        index = round(logical_x / 100 * (len(self.points) - 1))
         return max(0, min(len(self.points) - 1, index))
 
     def _index_for_position(self, position):
@@ -427,7 +639,7 @@ class CurveEditor(QWidget):
         rect = self.rect().adjusted(34, 18, -14, -34)
         if rect.width() <= 0:
             return 0
-        value = round((x - rect.left()) / rect.width() * 100)
+        value = round(self._value_for_x_ratio((x - rect.left()) / rect.width()))
         return max(0, min(100, value))
 
     def _set_point(self, index, value):
@@ -448,7 +660,7 @@ class CurveEditor(QWidget):
             return
         if self.preview_x is not None:
             rect = self.rect().adjusted(34, 18, -14, -34)
-            preview_pixel = rect.left() + rect.width() * self.preview_x / 100
+            preview_pixel = self._x_for_value(rect, self.preview_x)
             if abs(event.position().x() - preview_pixel) <= 10:
                 self.preview_dragging = True
                 self.setCursor(Qt.ClosedHandCursor)
@@ -459,6 +671,8 @@ class CurveEditor(QWidget):
 
     def mouseMoveEvent(self, event):
         if self.preview_dragging:
+            self.preview_x = self._preview_value_for_x(event.position().x())
+            self.update()
             return
         if self.active_index is not None:
             self._set_point(self.active_index, self._value_for_y(event.position().y()))
@@ -502,6 +716,7 @@ class PopupPanel(QWidget):
         ambient_source=None,
         on_source_selected=None,
         active_source="tray",
+        available_sources=None,
         on_nightlight_source_selected=None,
         active_nightlight_source="manual",
     ):
@@ -514,6 +729,8 @@ class PopupPanel(QWidget):
         self.ambient_source = ambient_source
         self.on_source_selected = on_source_selected
         self.active_source = active_source
+        self.available_sources = set(available_sources or ("tray", "ambient", "daytime"))
+        self.available_sources.add("tray")
         self.on_nightlight_source_selected = on_nightlight_source_selected
         self.active_nightlight_source = active_nightlight_source
         self._updating_source_selector = False
@@ -589,10 +806,8 @@ class PopupPanel(QWidget):
         source_label.setStyleSheet("color: white;")
         self.source_selector = QComboBox()
         self.source_selector.setInsertPolicy(QComboBox.NoInsert)
-        self.source_selector.addItem("Manual", "tray")
-        self.source_selector.addItem("Sensor", "ambient")
-        self.source_selector.addItem("Daytime", "daytime")
         self.source_selector.setStyleSheet("color: white; background-color: #333; border-radius: 4px; padding: 2px;")
+        self._populate_source_selector()
         self.source_selector.currentIndexChanged.connect(self._source_selector_changed)
         source_row.addWidget(source_label)
         source_row.addWidget(self.source_selector, 1)
@@ -609,6 +824,9 @@ class PopupPanel(QWidget):
         self.sliders = {}
         self.value_labels = {}
         self.slider_rows = {}
+        self.detail_row_icons = {}
+        self.bc_link_bracket = LinkBracket(self.bg)
+        self.bc_link_bracket.hide()
         visible_sliders = ["brightness", "contrast", "nightlight"]
         if self.light_mode:
             visible_sliders.insert(0, "light")
@@ -666,6 +884,8 @@ class PopupPanel(QWidget):
                 icon_label.setAlignment(Qt.AlignCenter)
                 row.addWidget(icon_label)
                 row_widgets.append(icon_label)
+                if name in ("brightness", "contrast"):
+                    self.detail_row_icons[name] = (icon_label, icon_path)
 
             slider = QSlider(Qt.Orientation.Horizontal)
             slider.setRange(0, 100)
@@ -682,6 +902,12 @@ class PopupPanel(QWidget):
                     background: #00aaff;
                     margin: -4px 0;
                     border-radius: 6px;
+                }
+                QSlider::groove:horizontal:disabled {
+                    background: #4a4a4a;
+                }
+                QSlider::handle:horizontal:disabled {
+                    background: #8a8a8a;
                 }
             """)
 
@@ -1130,14 +1356,62 @@ class PopupPanel(QWidget):
         if not self.light_mode:
             return
 
-        for key in ("brightness", "contrast"):
-            for widget in self.slider_rows.get(key, []):
-                widget.setVisible(self._detail_rows_visible)
+        linked = not self._detail_rows_visible
+        light_slider = self.sliders.get("light")
+        if light_slider is not None:
+            light_slider.setEnabled(linked)
+        light_label = self.value_labels.get("light")
+        if light_label is not None:
+            light_label.setStyleSheet("""
+                QLabel {
+                    color: %s;
+                }
+                QLabel:hover {
+                    color: #ffd166;
+                }
+            """ % ("white" if linked else "#8a8a8a"))
 
-        height = 270 if self._detail_rows_visible else 210
+        for key in ("brightness", "contrast"):
+            slider = self.sliders.get(key)
+            if slider is not None:
+                slider.setEnabled(not linked)
+            value_label = self.value_labels.get(key)
+            if value_label is not None:
+                value_label.setEnabled(not linked)
+                value_label.setStyleSheet("color: #8a8a8a;" if linked else "color: white;")
+            icon_data = self.detail_row_icons.get(key)
+            if icon_data is not None:
+                icon_label, icon_path = icon_data
+                icon_label.setText("")
+                icon_label.setStyleSheet("")
+                icon_label.setPixmap(QIcon(icon_path).pixmap(QSize(14, 14)))
+            for widget in self.slider_rows.get(key, []):
+                widget.setVisible(True)
+
+        height = 270
         self.setFixedSize(280, height)
         self.bg.setGeometry(0, 0, 280, height)
+        self._update_bc_link_bracket(linked)
+        QTimer.singleShot(0, lambda: self._update_bc_link_bracket(linked))
         self.place_bottom_right()
+
+    def _update_bc_link_bracket(self, visible):
+        if not visible:
+            self.bc_link_bracket.hide()
+            return
+        brightness_icon = self.detail_row_icons.get("brightness", (None, None))[0]
+        contrast_icon = self.detail_row_icons.get("contrast", (None, None))[0]
+        if brightness_icon is None or contrast_icon is None:
+            self.bc_link_bracket.hide()
+            return
+        top_left = brightness_icon.mapTo(self.bg, brightness_icon.rect().topLeft())
+        bottom_right = contrast_icon.mapTo(self.bg, contrast_icon.rect().bottomRight())
+        x = max(0, top_left.x() - 9)
+        y = top_left.y()
+        height = max(18, bottom_right.y() - top_left.y())
+        self.bc_link_bracket.setGeometry(x, y, 7, height)
+        self.bc_link_bracket.show()
+        self.bc_link_bracket.raise_()
 
     def show_nightlight_backend_menu(self, position):
         menu = QMenu(self)
@@ -1337,15 +1611,29 @@ class PopupPanel(QWidget):
         submit_light_values(self.monitor, brightness, contrast)
         return True
 
+    def _auto_curve_active(self):
+        return self.light_mode and not self._detail_rows_visible
+
     def apply_light_value(self, value):
         value = max(0, min(100, int(value)))
         if not self.light_mode:
             return False
-        brightness, contrast = self._light_to_brightness_contrast(value)
         self._set_slider_silent("light", value)
-        self._set_slider_silent("brightness", brightness)
-        self._set_slider_silent("contrast", contrast)
-        if self._safe_set_light_values(brightness, contrast):
+        if self._auto_curve_active():
+            brightness, contrast = self._light_to_brightness_contrast(value)
+            self._set_slider_silent("brightness", brightness)
+            self._set_slider_silent("contrast", contrast)
+            applied = self._safe_set_light_values(brightness, contrast)
+        else:
+            brightness = value
+            self._set_slider_silent("brightness", brightness)
+            submit_ddcci_command(
+                "brightness",
+                "Brightness set",
+                lambda monitor=self.monitor, brightness=brightness: monitor.set_brightness(brightness),
+            )
+            applied = True
+        if applied:
             self._remember_slider_values()
             return True
         return False
@@ -1488,7 +1776,7 @@ class PopupPanel(QWidget):
 
         dialog = QDialog(self)
         self._light_curve_dialog = dialog
-        dialog.setWindowTitle("Light curve")
+        dialog.setWindowTitle("B/C auto curve")
         dialog.setFixedSize(310, 515)
         cancel_button, apply_button = self._build_light_curve_settings(dialog, include_cancel=True)
         cancel_button.clicked.connect(dialog.reject)
@@ -1503,6 +1791,112 @@ class PopupPanel(QWidget):
 
         self._light_curve_dialog = None
 
+    def _build_smoothing_settings(self, parent):
+        layout = QVBoxLayout(parent)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(8)
+
+        def label(text, bold=False):
+            item = QLabel(text)
+            item.setStyleSheet("color: white;" + (" font-weight: bold;" if bold else ""))
+            return item
+
+        layout.addWidget(label("Smoothing", bold=True))
+
+        field_style = "color: white; background: #333; border: 1px solid #555; border-radius: 4px; padding: 3px;"
+        row_label_width = 130
+        field_width = 95
+
+        def add_combo_row(text, combo):
+            row_widget = QWidget()
+            row = QHBoxLayout(row_widget)
+            row.setContentsMargins(0, 0, 0, 0)
+            row_label = label(text)
+            row_label.setFixedWidth(row_label_width)
+            combo.setFixedWidth(field_width)
+            combo.setStyleSheet(field_style)
+            row.addWidget(row_label)
+            row.addWidget(combo)
+            row.addStretch()
+            layout.addWidget(row_widget)
+            return row_widget
+
+        def add_edit_row(text, edit):
+            row_widget = QWidget()
+            row = QHBoxLayout(row_widget)
+            row.setContentsMargins(0, 0, 0, 0)
+            row_label = label(text)
+            row_label.setFixedWidth(row_label_width)
+            edit.setFixedWidth(field_width)
+            edit.setStyleSheet(field_style)
+            row.addWidget(row_label)
+            row.addWidget(edit)
+            row.addStretch()
+            layout.addWidget(row_widget)
+            return row_widget
+
+        enabled_combo = QComboBox()
+        enabled_combo.setInsertPolicy(QComboBox.NoInsert)
+        enabled_combo.addItem("On", True)
+        enabled_combo.addItem("Off", False)
+        enabled_combo.setCurrentIndex(0 if bool(getattr(self.config, "AMBIENT_SMOOTHING_ENABLED", True)) else 1)
+        add_combo_row("Smoothing", enabled_combo)
+
+        mode_combo = QComboBox()
+        mode_combo.setInsertPolicy(QComboBox.NoInsert)
+        mode_combo.addItem("Steps", "steps")
+        mode_combo.addItem("Time (s)", "time")
+        mode = str(getattr(self.config, "AMBIENT_SMOOTHING_MODE", "steps"))
+        mode_combo.setCurrentIndex(max(0, mode_combo.findData(mode if mode in ("steps", "time") else "steps")))
+        mode_row = add_combo_row("Mode", mode_combo)
+
+        steps_edit = QLineEdit(str(self._config_int("AMBIENT_SMOOTHING_STEPS", 4)))
+        steps_row = add_edit_row("Steps", steps_edit)
+        seconds_edit = QLineEdit(str(self._ambient_config_float("AMBIENT_SMOOTHING_SECONDS", 2.0, 0.05, 120.0)))
+        seconds_row = add_edit_row("Time (s)", seconds_edit)
+        layout.addStretch()
+
+        updating = {"active": False}
+
+        def update_visibility():
+            enabled = bool(enabled_combo.currentData())
+            time_mode = mode_combo.currentData() == "time"
+            mode_row.setVisible(enabled)
+            steps_row.setVisible(enabled and not time_mode)
+            seconds_row.setVisible(enabled and time_mode)
+
+        def save_settings():
+            if updating["active"]:
+                return
+            enabled = bool(enabled_combo.currentData())
+            mode = mode_combo.currentData() if mode_combo.currentData() in ("steps", "time") else "steps"
+            try:
+                steps = int(float(steps_edit.text().replace(",", ".")))
+            except ValueError:
+                steps = 4
+            steps = max(1, min(100, steps))
+            try:
+                seconds = float(seconds_edit.text().replace(",", "."))
+            except ValueError:
+                seconds = 2.0
+            seconds = max(0.05, min(120.0, seconds))
+            updating["active"] = True
+            steps_edit.setText(str(steps))
+            seconds_edit.setText(f"{seconds:g}")
+            update_visibility()
+            updating["active"] = False
+            self.config.set("AMBIENT_SMOOTHING_ENABLED", enabled)
+            self.config.set("AMBIENT_SMOOTHING_MODE", mode)
+            self.config.set("AMBIENT_SMOOTHING_STEPS", steps)
+            self.config.set("AMBIENT_SMOOTHING_SECONDS", seconds)
+
+        enabled_combo.currentIndexChanged.connect(lambda index: (update_visibility(), save_settings()))
+        mode_combo.currentIndexChanged.connect(lambda index: (update_visibility(), save_settings()))
+        steps_edit.editingFinished.connect(save_settings)
+        seconds_edit.editingFinished.connect(save_settings)
+        update_visibility()
+        return {"save": save_settings}
+
     def _build_gamma_ramp_settings(self, parent):
         layout = QVBoxLayout(parent)
         layout.setContentsMargins(16, 14, 16, 14)
@@ -1510,9 +1904,11 @@ class PopupPanel(QWidget):
 
         general_label = QLabel("General")
         general_label.setStyleSheet("color: white; font-weight: bold;")
+        general_label.setFixedHeight(18)
         layout.addWidget(general_label)
 
         reset_button = QPushButton("Reset gamma")
+        reset_button.setFixedHeight(28)
         reset_button.setStyleSheet("""
             QPushButton {
                 color: white;
@@ -1529,10 +1925,12 @@ class PopupPanel(QWidget):
 
         target_label = QLabel("Nightlight target color")
         target_label.setStyleSheet("color: white; font-weight: bold;")
+        target_label.setFixedHeight(18)
         layout.addWidget(target_label)
 
         preview_button = QPushButton("Preview OFF")
         preview_button.setCheckable(True)
+        preview_button.setFixedHeight(28)
         preview_button.setStyleSheet("""
             QPushButton {
                 color: white;
@@ -1549,6 +1947,7 @@ class PopupPanel(QWidget):
 
         temperature_label = QLabel()
         temperature_label.setStyleSheet("color: white;")
+        temperature_label.setFixedHeight(18)
         layout.addWidget(temperature_label)
 
         temperature_slider = QSlider(Qt.Orientation.Horizontal)
@@ -1579,6 +1978,7 @@ class PopupPanel(QWidget):
 
         button_row = QHBoxLayout()
         apply_button = QPushButton("Apply")
+        apply_button.setFixedHeight(28)
         button_row.addStretch()
         button_row.addWidget(apply_button)
         layout.addLayout(button_row)
@@ -1731,9 +2131,35 @@ class PopupPanel(QWidget):
         return max(minimum, min(maximum, value))
 
     def _build_ambient_sensor_settings(self, parent):
-        layout = QVBoxLayout(parent)
+        root_layout = QVBoxLayout(parent)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+        tabs = QTabWidget()
+        tabs.setStyleSheet("""
+            QTabWidget::pane {
+                border: none;
+            }
+            QTabBar::tab {
+                color: white;
+                background: #333;
+                padding: 6px 10px;
+            }
+            QTabBar::tab:selected {
+                background: #444;
+            }
+        """)
+        main_tab = QWidget()
+        advanced_tab = QWidget()
+        layout = QVBoxLayout(main_tab)
         layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(8)
+        advanced_layout = QVBoxLayout(advanced_tab)
+        advanced_layout.setContentsMargins(16, 14, 16, 14)
+        advanced_layout.setSpacing(8)
+        tabs.addTab(main_tab, "Main")
+        tabs.addTab(advanced_tab, "Advanced")
+        root_layout.addWidget(tabs)
+        started_passive = {"value": False}
 
         def label(text, bold=False):
             item = QLabel(text)
@@ -1743,33 +2169,108 @@ class PopupPanel(QWidget):
                 item.setStyleSheet("color: white;")
             return item
 
+        value_label_width = 145
+        value_field_width = 90
+        sensor_config_updating = {"active": False}
         field_style = "color: white; background: #333; border: 1px solid #555; border-radius: 4px; padding: 3px;"
-        graph = AmbientLuxGraph()
-        layout.addWidget(graph)
+
+        def add_value_row(text, edit, target_layout=None):
+            row_widget = QWidget()
+            row = QHBoxLayout(row_widget)
+            row.setContentsMargins(0, 0, 0, 0)
+            row_label = label(text)
+            row_label.setFixedWidth(value_label_width)
+            edit.setFixedWidth(value_field_width)
+            edit.setStyleSheet(field_style)
+            row.addWidget(row_label)
+            row.addWidget(edit)
+            row.addStretch()
+            (target_layout or layout).addWidget(row_widget)
+            return row_widget
+
+        def add_combo_row(text, combo, target_layout=None):
+            row_widget = QWidget()
+            row = QHBoxLayout(row_widget)
+            row.setContentsMargins(0, 0, 0, 0)
+            row_label = label(text)
+            row_label.setFixedWidth(value_label_width)
+            combo.setFixedWidth(value_field_width)
+            combo.setStyleSheet(field_style)
+            row.addWidget(row_label)
+            row.addWidget(combo)
+            row.addStretch()
+            (target_layout or layout).addWidget(row_widget)
+            return row_widget
+
+        sensor_config_label = label("Sensor runtime", bold=True)
+        advanced_layout.addWidget(sensor_config_label)
+        sensor_mode_combo = QComboBox()
+        sensor_mode_combo.setInsertPolicy(QComboBox.NoInsert)
+        sensor_mode_combo.addItem("Auto", "auto")
+        sensor_mode_combo.addItem("Interval", "interval")
+        sensor_mode = str(getattr(self.config, "AMBIENT_SENSOR_PUBLISH_MODE", "auto"))
+        sensor_mode_combo.setCurrentIndex(max(0, sensor_mode_combo.findData(sensor_mode if sensor_mode in ("auto", "interval") else "auto")))
+        add_combo_row("Push mode", sensor_mode_combo, advanced_layout)
+        sensor_refresh_edit = QLineEdit(str(self._config_int("AMBIENT_SENSOR_REFRESH_MS", 100)))
+        sensor_refresh_row = add_value_row("Read every ms", sensor_refresh_edit, advanced_layout)
+        sensor_change_edit = QLineEdit(str(self._ambient_config_float("AMBIENT_SENSOR_PUBLISH_LUX_CHANGE_PERCENT", 1.0, 0.0, 100.0)))
+        sensor_change_row = add_value_row("Push change %", sensor_change_edit, advanced_layout)
+        sensor_interval_edit = QLineEdit(str(self._config_int("AMBIENT_SENSOR_PUBLISH_MAX_INTERVAL_SECONDS", 30)))
+        sensor_interval_row = add_value_row("Max push interval s", sensor_interval_edit, advanced_layout)
+        sensor_status_label = label("")
+        advanced_layout.addWidget(sensor_status_label)
+        advanced_layout.addStretch()
+        sensor_config_last = {
+            "values": {
+                "refreshMs": self._config_int("AMBIENT_SENSOR_REFRESH_MS", 100),
+                "publishLuxChangePercent": self._ambient_config_float("AMBIENT_SENSOR_PUBLISH_LUX_CHANGE_PERCENT", 1.0, 0.0, 100.0),
+                "publishMaxIntervalSeconds": self._config_int("AMBIENT_SENSOR_PUBLISH_MAX_INTERVAL_SECONDS", 30),
+                "publishMode": sensor_mode if sensor_mode in ("auto", "interval") else "auto",
+            }
+        }
+        sensor_config_pending = {"values": None}
+
+        min_lux_edit = QLineEdit(str(self._ambient_config_float("AMBIENT_MIN_LUX", 5.0, 0.001, 100000.0)))
+        max_lux_edit = QLineEdit(str(self._ambient_config_float("AMBIENT_MAX_LUX", 500.0, 0.001, 100000.0)))
+        for edit in (min_lux_edit, max_lux_edit):
+            edit.setFixedWidth(72)
+            edit.setStyleSheet(field_style)
 
         layout.addWidget(label("Calibration", bold=True))
-        min_lux_row = QHBoxLayout()
-        min_lux_row.addWidget(label("Lux 0%"))
-        min_lux_edit = QLineEdit(str(self._ambient_config_float("AMBIENT_MIN_LUX", 5.0, 0.001, 100000.0)))
-        min_lux_edit.setStyleSheet(field_style)
-        min_lux_row.addWidget(min_lux_edit)
-        layout.addLayout(min_lux_row)
+        graph_row = QHBoxLayout()
+        graph = AmbientLuxGraph()
+        graph.set_threshold_edits(min_lux_edit, max_lux_edit)
+        graph_row.addWidget(graph, 1)
+        layout.addLayout(graph_row)
 
-        max_lux_row = QHBoxLayout()
-        max_lux_row.addWidget(label("Lux 100%"))
-        max_lux_edit = QLineEdit(str(self._ambient_config_float("AMBIENT_MAX_LUX", 500.0, 0.001, 100000.0)))
-        max_lux_edit.setStyleSheet(field_style)
-        max_lux_row.addWidget(max_lux_edit)
-        layout.addLayout(max_lux_row)
-
-        smoothing_row = QHBoxLayout()
-        smoothing_row.addWidget(label("Smoothing (s)"))
-        smoothing_edit = QLineEdit(str(self._ambient_config_float("AMBIENT_SMOOTHING_SECONDS", 2.0, 0.0, 60.0)))
-        smoothing_edit.setStyleSheet(field_style)
-        smoothing_row.addWidget(smoothing_edit)
-        layout.addLayout(smoothing_row)
+        ambient_curve_points = self._validated_curve_points(getattr(self.config, "AMBIENT_LIGHT_CURVE_POINTS", None))
+        if ambient_curve_points is None:
+            ambient_curve_points = [0, 17, 33, 50, 67, 83, 100]
+        curve_label = label("Lux -> screen light (exponential lux scale)", bold=True)
+        curve_editor = CurveEditor(
+            ambient_curve_points,
+            y_label="Screen light",
+            y_tick_labels={0: "0%", 50: "50%", 100: "100%"},
+            x_display_exponent=0.5,
+            x_tick_labels={0: "Lux 0%", 10: "10%", 30: "30%", 100: "100%"},
+        )
+        curve_editor.setMinimumHeight(175)
+        layout.addWidget(curve_label)
+        layout.addWidget(curve_editor)
         layout.addStretch()
         updating_thresholds = {"active": False}
+
+        def normalized_lux(lux, min_lux, max_lux):
+            try:
+                lux = float(lux)
+            except (TypeError, ValueError):
+                return None
+            log_min = math.log10(max(0.001, min_lux))
+            log_max = math.log10(max(min_lux + 0.001, max_lux))
+            if log_max <= log_min:
+                return None
+            clamped_lux = max(min_lux, min(lux, max_lux))
+            return (math.log10(clamped_lux) - log_min) / (log_max - log_min) * 100
 
         def parse_float(edit, fallback, minimum, maximum):
             try:
@@ -1778,18 +2279,110 @@ class PopupPanel(QWidget):
                 value = fallback
             return max(minimum, min(maximum, value))
 
+        def parse_int(edit, fallback, minimum, maximum):
+            try:
+                value = int(float(edit.text().replace(",", ".")))
+            except ValueError:
+                value = fallback
+            return max(minimum, min(maximum, value))
+
+        def sensor_config_values():
+            mode = sensor_mode_combo.currentData() or "auto"
+            if mode not in ("auto", "interval"):
+                mode = "auto"
+            return {
+                "refreshMs": parse_int(sensor_refresh_edit, 100, 50, 60000),
+                "publishLuxChangePercent": parse_float(sensor_change_edit, 1.0, 0.0, 100.0),
+                "publishMaxIntervalSeconds": parse_int(sensor_interval_edit, 30, 1, 86400),
+                "publishMode": mode,
+            }
+
+        def update_sensor_config_visibility():
+            interval_mode = (sensor_mode_combo.currentData() or "auto") == "interval"
+            sensor_change_row.setVisible(not interval_mode)
+            sensor_interval_row.setVisible(True)
+            sensor_refresh_row.setVisible(True)
+
+        def set_sensor_config_fields(values):
+            sensor_config_updating["active"] = True
+            sensor_refresh_edit.setText(str(values["refreshMs"]))
+            sensor_change_edit.setText(f"{float(values['publishLuxChangePercent']):g}")
+            sensor_interval_edit.setText(str(values["publishMaxIntervalSeconds"]))
+            index = sensor_mode_combo.findData(values["publishMode"])
+            sensor_mode_combo.setCurrentIndex(index if index >= 0 else 0)
+            update_sensor_config_visibility()
+            sensor_config_updating["active"] = False
+
+        def remember_sensor_config(values, save_file=True):
+            sensor_config_last["values"] = dict(values)
+            if save_file:
+                self.config.set("AMBIENT_SENSOR_REFRESH_MS", values["refreshMs"])
+                self.config.set("AMBIENT_SENSOR_PUBLISH_LUX_CHANGE_PERCENT", values["publishLuxChangePercent"])
+                self.config.set("AMBIENT_SENSOR_PUBLISH_MAX_INTERVAL_SECONDS", values["publishMaxIntervalSeconds"])
+                self.config.set("AMBIENT_SENSOR_PUBLISH_MODE", values["publishMode"])
+
+        def save_sensor_config():
+            if sensor_config_updating["active"]:
+                return sensor_config_values()
+            values = sensor_config_values()
+            if self.ambient_source is None or not self.ambient_source.apply_sensor_config(values):
+                set_sensor_config_fields(sensor_config_last["values"])
+                sensor_status_label.setText("not connected")
+                return sensor_config_last["values"]
+            sensor_config_pending["values"] = dict(values)
+            set_sensor_config_fields(values)
+            sensor_status_label.setText("sent")
+            return values
+
         def save_settings():
             min_lux = parse_float(min_lux_edit, 5.0, 0.001, 100000.0)
             max_lux = parse_float(max_lux_edit, 500.0, min_lux + 0.001, 100000.0)
-            smoothing_seconds = parse_float(smoothing_edit, 2.0, 0.0, 60.0)
             min_lux_edit.setText(f"{min_lux:g}")
             max_lux_edit.setText(f"{max_lux:g}")
-            smoothing_edit.setText(f"{smoothing_seconds:g}")
             self.config.set("AMBIENT_MIN_LUX", min_lux)
             self.config.set("AMBIENT_MAX_LUX", max_lux)
-            self.config.set("AMBIENT_SMOOTHING_SECONDS", smoothing_seconds)
+            self.config.set("AMBIENT_LIGHT_CURVE_POINTS", list(curve_editor.points))
             if not updating_thresholds["active"]:
                 graph.set_thresholds(min_lux, max_lux)
+
+        def apply_lux_threshold_fields(normalize_text=False):
+            if updating_thresholds["active"]:
+                return
+            try:
+                min_lux = float(min_lux_edit.text().replace(",", "."))
+                max_lux = float(max_lux_edit.text().replace(",", "."))
+            except ValueError:
+                return
+            min_lux = max(0.001, min(min_lux, 100000.0))
+            max_lux = max(min_lux + 0.001, min(max_lux, 100000.0))
+            if normalize_text:
+                min_lux_edit.setText(f"{min_lux:g}")
+                max_lux_edit.setText(f"{max_lux:g}")
+            self.config._data["AMBIENT_MIN_LUX"] = min_lux
+            self.config._data["AMBIENT_MAX_LUX"] = max_lux
+            self.config.AMBIENT_MIN_LUX = min_lux
+            self.config.AMBIENT_MAX_LUX = max_lux
+            graph.set_thresholds(min_lux, max_lux)
+            if self.ambient_source is not None:
+                self.ambient_source.recalculate_current()
+            status = self.ambient_source.status() if self.ambient_source is not None else {}
+            current_x = normalized_lux(status.get("filtered_lux") or status.get("lux"), min_lux, max_lux)
+            curve_editor.current_x = current_x
+            curve_editor.current_y = (
+                self._curve_value_from_points(curve_editor.points, current_x)
+                if current_x is not None
+                else None
+            )
+            curve_editor.update()
+
+        def update_curve_live(points):
+            points = list(points)
+            self.config._data["AMBIENT_LIGHT_CURVE_POINTS"] = points
+            self.config.AMBIENT_LIGHT_CURVE_POINTS = points
+
+        def save_curve(points):
+            update_curve_live(points)
+            self.config.set("AMBIENT_LIGHT_CURVE_POINTS", list(points))
 
         def format_number(value, decimals=2):
             if value is None:
@@ -1803,11 +2396,47 @@ class PopupPanel(QWidget):
             if self.ambient_source is None:
                 return
             status = self.ambient_source.status()
+            runtime_config = status.get("sensor_config")
+            if isinstance(runtime_config, dict):
+                runtime_values = {
+                    "refreshMs": int(runtime_config.get("refreshMs", sensor_config_last["values"]["refreshMs"])),
+                    "publishLuxChangePercent": float(runtime_config.get("publishLuxChangePercent", sensor_config_last["values"]["publishLuxChangePercent"])),
+                    "publishMaxIntervalSeconds": int(runtime_config.get("publishMaxIntervalSeconds", sensor_config_last["values"]["publishMaxIntervalSeconds"])),
+                    "publishMode": runtime_config.get("publishMode") if runtime_config.get("publishMode") in ("auto", "interval") else sensor_config_last["values"]["publishMode"],
+                }
+                save_runtime = sensor_config_pending["values"] is not None
+                remember_sensor_config(runtime_values, save_file=save_runtime)
+                sensor_config_pending["values"] = None
+                sensor_config_updating["active"] = True
+                if not sensor_refresh_edit.hasFocus() and "refreshMs" in runtime_config:
+                    sensor_refresh_edit.setText(str(runtime_config["refreshMs"]))
+                if not sensor_change_edit.hasFocus() and "publishLuxChangePercent" in runtime_config:
+                    sensor_change_edit.setText(f"{float(runtime_config['publishLuxChangePercent']):g}")
+                if not sensor_interval_edit.hasFocus() and "publishMaxIntervalSeconds" in runtime_config:
+                    sensor_interval_edit.setText(str(runtime_config["publishMaxIntervalSeconds"]))
+                mode = runtime_config.get("publishMode")
+                if mode in ("auto", "interval") and not sensor_mode_combo.hasFocus():
+                    index = sensor_mode_combo.findData(mode)
+                    if index >= 0:
+                        sensor_mode_combo.setCurrentIndex(index)
+                update_sensor_config_visibility()
+                sensor_config_updating["active"] = False
+                sensor_status_label.setText("sensor config ok")
+            elif status.get("sensor_config_error"):
+                sensor_config_pending["values"] = None
+                set_sensor_config_fields(sensor_config_last["values"])
+                sensor_status_label.setText(str(status.get("sensor_config_error")))
             if graph._dragging is None:
-                graph.set_thresholds(
-                    self._ambient_config_float("AMBIENT_MIN_LUX", 5.0, 0.001, 100000.0),
-                    self._ambient_config_float("AMBIENT_MAX_LUX", 500.0, 0.001, 100000.0),
-                )
+                min_lux = self._ambient_config_float("AMBIENT_MIN_LUX", 5.0, 0.001, 100000.0)
+                max_lux = self._ambient_config_float("AMBIENT_MAX_LUX", 500.0, 0.001, 100000.0)
+                graph.set_thresholds(min_lux, max_lux)
+                current_x = normalized_lux(status.get("filtered_lux") or status.get("lux"), min_lux, max_lux)
+                curve_editor.current_x = current_x
+                if current_x is not None:
+                    curve_editor.current_y = self._curve_value_from_points(curve_editor.points, current_x)
+                else:
+                    curve_editor.current_y = None
+                curve_editor.update()
             graph.add_sample(status.get("lux"), status.get("filtered_lux"), status.get("saturated"))
 
         def graph_thresholds_changed(min_lux, max_lux):
@@ -1816,40 +2445,353 @@ class PopupPanel(QWidget):
             max_lux_edit.setText(f"{max_lux:.3g}")
             self.config.set("AMBIENT_MIN_LUX", min_lux)
             self.config.set("AMBIENT_MAX_LUX", max_lux)
+            if self.ambient_source is not None:
+                self.ambient_source.recalculate_current()
             updating_thresholds["active"] = False
+            refresh_status()
 
         graph.thresholds_changed.connect(graph_thresholds_changed)
-        min_lux_edit.editingFinished.connect(save_settings)
-        max_lux_edit.editingFinished.connect(save_settings)
-        smoothing_edit.editingFinished.connect(save_settings)
+        curve_editor.points_changed.connect(update_curve_live)
+        curve_editor.point_edit_finished.connect(save_curve)
+        sensor_refresh_edit.editingFinished.connect(save_sensor_config)
+        sensor_change_edit.editingFinished.connect(save_sensor_config)
+        sensor_interval_edit.editingFinished.connect(save_sensor_config)
+        def sensor_mode_changed(index):
+            update_sensor_config_visibility()
+            save_sensor_config()
+
+        sensor_mode_combo.currentIndexChanged.connect(sensor_mode_changed)
+        update_sensor_config_visibility()
+        min_lux_edit.textEdited.connect(lambda text: apply_lux_threshold_fields(False))
+        max_lux_edit.textEdited.connect(lambda text: apply_lux_threshold_fields(False))
+        min_lux_edit.editingFinished.connect(lambda: (apply_lux_threshold_fields(True), save_settings(), refresh_status()))
+        max_lux_edit.editingFinished.connect(lambda: (apply_lux_threshold_fields(True), save_settings(), refresh_status()))
 
         status_timer = QTimer(parent)
         status_timer.timeout.connect(refresh_status)
         status_timer.start(100)
         save_settings()
+        if self.ambient_source is not None:
+            if not self.ambient_source.is_running():
+                started_passive["value"] = bool(self.ambient_source.start_passive())
+            else:
+                status = self.ambient_source.status()
+                started_passive["value"] = not bool(getattr(self.config, "AMBIENT_SOURCE_ENABLED", False))
+                if status.get("lux") is None and status.get("filtered_lux") is None:
+                    self.ambient_source.request_measurement(force=True)
+            self.ambient_source.request_sensor_config()
+
+        def cleanup():
+            if (
+                started_passive["value"]
+                and self.ambient_source is not None
+                and not bool(getattr(self.config, "AMBIENT_SOURCE_ENABLED", False))
+            ):
+                self.ambient_source.stop()
+
         refresh_status()
-        return {"timer": status_timer, "save": save_settings}
+        return {"timer": status_timer, "save": save_settings, "cleanup": cleanup}
+
+    def _build_daytime_settings(self, parent):
+        layout = QVBoxLayout(parent)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(8)
+        field_style = "color: white; background: #333; border: 1px solid #555; border-radius: 4px; padding: 3px;"
+
+        def label(text, bold=False):
+            item = QLabel(text)
+            item.setStyleSheet("color: white;" + (" font-weight: bold;" if bold else ""))
+            return item
+
+        def config_float(name, default, minimum, maximum):
+            try:
+                value = float(getattr(self.config, name, default))
+            except (TypeError, ValueError):
+                value = default
+            return max(minimum, min(maximum, value))
+
+        def config_mode():
+            mode = str(getattr(self.config, "DAYTIME_SOLAR_MODE", "auto"))
+            return mode if mode in ("auto", "manual") else "auto"
+
+        def current_location():
+            latitude = config_float("DAYTIME_LATITUDE", 48.8566, -89.8, 89.8)
+            longitude = config_float("DAYTIME_LONGITUDE", 2.3522, -180.0, 180.0)
+            name = str(getattr(self.config, "DAYTIME_LOCATION_NAME", "France"))
+            return name, latitude, longitude
+
+        def sun_hours():
+            try:
+                return solar_hours(
+                    datetime.datetime.now().astimezone(),
+                    config_float("DAYTIME_LATITUDE", 48.8566, -89.8, 89.8),
+                    config_float("DAYTIME_LONGITUDE", 2.3522, -180.0, 180.0),
+                )
+            except Exception:
+                return 7.5, 18.5
+
+        def current_position():
+            sunrise, sunset = sun_hours()
+            return daytime_position(datetime.datetime.now(), sunrise, sunset)
+
+        def add_row(text, widget):
+            row = QHBoxLayout()
+            row_label = label(text)
+            row_label.setFixedWidth(92)
+            row.addWidget(row_label)
+            row.addWidget(widget, 1)
+            layout.addLayout(row)
+
+        mode_combo = QComboBox()
+        mode_combo.setInsertPolicy(QComboBox.NoInsert)
+        mode_combo.addItem("Auto", "auto")
+        mode_combo.addItem("Manual country", "manual")
+        mode_combo.setStyleSheet(field_style)
+        mode_combo.setCurrentIndex(max(0, mode_combo.findData(config_mode())))
+
+        location_name, latitude, longitude = current_location()
+        location_combo = QComboBox()
+        location_combo.setInsertPolicy(QComboBox.NoInsert)
+        location_combo.addItems(sorted(DAYTIME_LOCATION_PRESETS.keys()))
+        location_combo.setStyleSheet(field_style)
+        preset_index = location_combo.findText(location_name, Qt.MatchFixedString)
+        if preset_index >= 0:
+            location_combo.setCurrentIndex(preset_index)
+        else:
+            location_combo.setCurrentIndex(max(0, location_combo.findText("France", Qt.MatchFixedString)))
+
+        preview_button = QPushButton("Preview OFF")
+        preview_button.setCheckable(True)
+        preview_button.setFixedHeight(28)
+        preview_button.setStyleSheet("""
+            QPushButton {
+                color: white;
+                background-color: #333;
+                border: 1px solid #555;
+                border-radius: 4px;
+                padding: 4px 10px;
+            }
+            QPushButton:checked {
+                background-color: #4f6f42;
+                border-color: #78a85f;
+            }
+        """)
+
+        add_row("Zone", mode_combo)
+        add_row("Country/region", location_combo)
+
+        computed_label = label("")
+        layout.addWidget(computed_label)
+
+        light_points = self._validated_curve_points(getattr(self.config, "DAYTIME_LIGHT_CURVE_POINTS", None))
+        if light_points is None:
+            light_points = [18, 28, 55, 100, 55, 28, 18]
+        color_points = self._validated_curve_points(getattr(self.config, "DAYTIME_COLOR_CURVE_POINTS", None))
+        if color_points is None:
+            color_points = [70, 50, 18, 0, 18, 50, 70]
+
+        current_x = current_position()
+        light_editor = CurveEditor(
+            light_points,
+            x_labels=("Sunrise", "Midday", "Sunset"),
+            y_label="Screen light",
+            y_tick_labels={0: "0%", 50: "50%", 100: "100%"},
+            current_x=current_x,
+            current_y=self._curve_value_from_points(light_points, current_x),
+            preview_x=None,
+        )
+        color_editor = CurveEditor(
+            color_points,
+            x_labels=("Sunrise", "Midday", "Sunset"),
+            y_label="Color",
+            y_tick_labels={0: "cold", 50: "mid", 100: "warm"},
+            current_x=current_x,
+            current_y=self._curve_value_from_points(color_points, current_x),
+            preview_x=None,
+        )
+        light_editor.setMinimumHeight(165)
+        color_editor.setMinimumHeight(165)
+        layout.addWidget(label("Daytime light", bold=True))
+        layout.addWidget(preview_button)
+        layout.addWidget(light_editor)
+        layout.addWidget(label("Daytime color", bold=True))
+        layout.addWidget(color_editor)
+        layout.addStretch()
+        preview_state = {"original": None}
+
+        def update_field_visibility():
+            manual = mode_combo.currentData() == "manual"
+            location_combo.setEnabled(manual)
+
+        def selected_location():
+            text = location_combo.currentText().strip()
+            preset = DAYTIME_LOCATION_PRESETS.get(text)
+            if preset is not None:
+                return text, preset[0], preset[1]
+            return "France", DAYTIME_LOCATION_PRESETS["France"][0], DAYTIME_LOCATION_PRESETS["France"][1]
+
+        def save_settings(refresh=True):
+            mode = mode_combo.currentData() or "auto"
+            location, latitude, longitude = selected_location()
+            self.config.set("DAYTIME_SOLAR_MODE", mode)
+            self.config.set("DAYTIME_LOCATION_NAME", location)
+            self.config.set("DAYTIME_LATITUDE", latitude)
+            self.config.set("DAYTIME_LONGITUDE", longitude)
+            self.config.set("DAYTIME_LIGHT_CURVE_POINTS", list(light_editor.points))
+            self.config.set("DAYTIME_COLOR_CURVE_POINTS", list(color_editor.points))
+            if refresh:
+                refresh_markers()
+
+        def update_curve_live():
+            self.config._data["DAYTIME_LIGHT_CURVE_POINTS"] = list(light_editor.points)
+            self.config.DAYTIME_LIGHT_CURVE_POINTS = list(light_editor.points)
+            self.config._data["DAYTIME_COLOR_CURVE_POINTS"] = list(color_editor.points)
+            self.config.DAYTIME_COLOR_CURVE_POINTS = list(color_editor.points)
+            refresh_markers()
+
+        def save_curve():
+            update_curve_live()
+            self.config.set("DAYTIME_LIGHT_CURVE_POINTS", list(light_editor.points))
+            self.config.set("DAYTIME_COLOR_CURVE_POINTS", list(color_editor.points))
+
+        def set_preview_bar_visible(visible):
+            x = current_position() if visible else None
+            light_editor.preview_x = x
+            color_editor.preview_x = x
+            light_editor.update()
+            color_editor.update()
+
+        def restore_preview():
+            original = preview_state["original"]
+            preview_state["original"] = None
+            if original is None:
+                return
+            if "light" in self.sliders:
+                self._set_slider_silent("light", original["light"])
+            self._set_slider_silent("brightness", original["brightness"])
+            self._set_slider_silent("contrast", original["contrast"])
+            self._set_slider_silent("nightlight", original["nightlight"])
+            self.apply_light_value(original["light"])
+            self._safe_set_nightlight_strength(original["nightlight"])
+            self._remember_slider_values()
+
+        def apply_preview(position):
+            if not preview_button.isChecked():
+                return
+            position = max(0.0, min(float(position), 100.0))
+            light = round(self._curve_value_from_points(light_editor.points, position))
+            color = round(self._curve_value_from_points(color_editor.points, position))
+            self.apply_light_value(light)
+            self._set_slider_silent("nightlight", color)
+            self._safe_set_nightlight_strength(color)
+
+        def preview_toggled(checked):
+            preview_button.setText("Preview ON" if checked else "Preview OFF")
+            if checked:
+                preview_state["original"] = {
+                    "light": self.sliders["light"].value() if "light" in self.sliders else self.sliders["brightness"].value(),
+                    "brightness": self.sliders["brightness"].value(),
+                    "contrast": self.sliders["contrast"].value(),
+                    "nightlight": self.sliders["nightlight"].value(),
+                }
+                set_preview_bar_visible(True)
+                apply_preview(current_position())
+            else:
+                set_preview_bar_visible(False)
+                restore_preview()
+
+        def refresh_markers():
+            sunrise, sunset = sun_hours()
+            x = daytime_position(datetime.datetime.now(), sunrise, sunset)
+            computed_label.setText(f"Today sunrise {format_hour(sunrise)}   Today sunset {format_hour(sunset)}")
+            for editor in (light_editor, color_editor):
+                editor.x_labels = ("Sunrise", "Midday", "Sunset")
+                editor.current_x = x
+                if preview_button.isChecked() and editor.preview_x is None:
+                    editor.preview_x = x
+            light_editor.current_y = self._curve_value_from_points(light_editor.points, x)
+            color_editor.current_y = self._curve_value_from_points(color_editor.points, x)
+            light_editor.update()
+            color_editor.update()
+            update_field_visibility()
+
+        mode_combo.currentIndexChanged.connect(save_settings)
+        location_combo.currentIndexChanged.connect(lambda index: save_settings())
+        preview_button.toggled.connect(preview_toggled)
+        light_editor.points_changed.connect(lambda points: update_curve_live())
+        color_editor.points_changed.connect(lambda points: update_curve_live())
+        light_editor.point_edit_finished.connect(lambda points: save_curve())
+        color_editor.point_edit_finished.connect(lambda points: save_curve())
+        light_editor.preview_changed.connect(apply_preview)
+        color_editor.preview_changed.connect(apply_preview)
+
+        refresh_timer = QTimer(parent)
+        refresh_timer.timeout.connect(refresh_markers)
+        refresh_timer.start(30000)
+        refresh_markers()
+        return {"timer": refresh_timer, "save": save_settings, "cleanup": restore_preview}
 
     def open_display_settings(self, initial_tab=None):
         dialog = QDialog(self)
         self._display_settings_dialog = dialog
         dialog.setWindowTitle("Display settings")
-        dialog_width = 340
+        dialog_width = 560
+        min_settings_height = 585
         light_height = 620
-        color_height = 360
-        gamma_height = 315
-        nightlight_curve_height = 370
-        ambient_height = 475
+        smoothing_height = 585
+        daytime_height = 585
+        nightlight_color_height = 405
+        ambient_height = 665
         dialog.setFixedSize(dialog_width, light_height)
 
         layout = QVBoxLayout(dialog)
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(8)
 
-        tabs = QTabWidget()
-        tabs.setStyleSheet("""
-            QTabWidget::pane {
+        settings_row = QHBoxLayout()
+        settings_row.setSpacing(8)
+
+        page_list = QListWidget()
+        page_list.setFixedWidth(170)
+        page_list.setStyleSheet("""
+            QListWidget {
+                color: white;
+                background: #2b2b2b;
                 border: 1px solid #444;
+            }
+            QListWidget::item {
+                background: #333;
+                padding: 8px;
+                border-bottom: 1px solid #3f3f3f;
+            }
+            QListWidget::item:selected {
+                background: #444;
+            }
+            QListWidget::item:disabled {
+                color: #9a9a9a;
+                background: #262626;
+            }
+        """)
+        page_stack = QStackedWidget()
+        page_stack.setStyleSheet("QStackedWidget { border: 1px solid #444; }")
+
+        light_tab = QWidget()
+        self._build_light_curve_settings(light_tab, include_cancel=False)
+
+        smoothing_tab = QWidget()
+        smoothing_controls = self._build_smoothing_settings(smoothing_tab)
+
+        daytime_tab = QWidget()
+        daytime_controls = self._build_daytime_settings(daytime_tab)
+
+        nightlight_color_tab = QWidget()
+        nightlight_color_layout = QVBoxLayout(nightlight_color_tab)
+        nightlight_color_layout.setContentsMargins(0, 0, 0, 0)
+        nightlight_color_layout.setSpacing(0)
+        nightlight_color_tabs = QTabWidget()
+        nightlight_color_tabs.setStyleSheet("""
+            QTabWidget::pane {
+                border: none;
             }
             QTabBar::tab {
                 color: white;
@@ -1860,28 +2802,72 @@ class PopupPanel(QWidget):
                 background: #444;
             }
         """)
-
-        light_tab = QWidget()
-        self._build_light_curve_settings(light_tab, include_cancel=False)
-        tabs.addTab(light_tab, "Light curve")
-
         color_tab = QWidget()
         color_controls = self._build_nightlight_color_settings(color_tab, include_cancel=False, preview_changes=False)
-        tabs.addTab(color_tab, "RGB color")
 
         gamma_tab = QWidget()
         gamma_controls = self._build_gamma_ramp_settings(gamma_tab)
-        tabs.addTab(gamma_tab, "Gamma ramp")
 
         nightlight_curve_tab = QWidget()
         nightlight_curve_controls = self._build_light_linked_nightlight_settings(nightlight_curve_tab)
-        tabs.addTab(nightlight_curve_tab, "Light-Nightlight link")
 
-        ambient_tab = QWidget()
-        ambient_controls = self._build_ambient_sensor_settings(ambient_tab)
-        tabs.addTab(ambient_tab, "Ambient sensor")
+        nightlight_color_tabs.addTab(color_tab, "RGB")
+        nightlight_color_tabs.addTab(gamma_tab, "Gamma ramp")
+        nightlight_color_tabs.addTab(nightlight_curve_tab, "Light-color link")
+        nightlight_color_layout.addWidget(nightlight_color_tabs)
 
-        layout.addWidget(tabs)
+        show_ambient = self.ambient_source is not None and "ambient" in self.available_sources
+        ambient_tab = None
+        if show_ambient:
+            ambient_tab = QWidget()
+            ambient_controls = self._build_ambient_sensor_settings(ambient_tab)
+        else:
+            ambient_controls = {"save": lambda: None, "cleanup": lambda: None}
+
+        pages = []
+        page_groups = [
+            (
+                "Main settings",
+                [
+                    ("light", "B/C auto curve", light_tab, light_height),
+                    ("smoothing", "Smoothing", smoothing_tab, smoothing_height),
+                    ("nightlight_color", "Nightlight color", nightlight_color_tab, nightlight_color_height),
+                ],
+            ),
+            (
+                "Control sources",
+                [
+                    ("daytime", "Daytime", daytime_tab, daytime_height),
+                ] + (
+                    [("ambient", "Light sensor", ambient_tab, ambient_height)] if show_ambient else []
+                ),
+            ),
+        ]
+
+        def add_page_header(text):
+            item = QListWidgetItem(text)
+            item.setFlags(Qt.NoItemFlags)
+            page_list.addItem(item)
+
+        def add_page_item(key, text, widget, height):
+            page_index = len(pages)
+            pages.append((key, text, widget, height))
+            item = QListWidgetItem(text)
+            item.setData(Qt.UserRole, page_index)
+            item.setData(Qt.UserRole + 1, key)
+            page_list.addItem(item)
+            page_stack.addWidget(widget)
+
+        for group_label, group_pages in page_groups:
+            if not group_pages:
+                continue
+            add_page_header(group_label)
+            for key, text, widget, height in group_pages:
+                add_page_item(key, text, widget, height)
+
+        settings_row.addWidget(page_list)
+        settings_row.addWidget(page_stack, 1)
+        layout.addLayout(settings_row)
 
         button_row = QHBoxLayout()
         close_button = QPushButton("Close")
@@ -1915,8 +2901,12 @@ class PopupPanel(QWidget):
                         reset_gamma()
                     except Exception as e:
                         print("[WARN] Gamma ramp reset failed:", e)
+            daytime_controls["cleanup"]()
+            smoothing_controls["save"]()
             nightlight_curve_controls["save"]()
+            daytime_controls["save"]()
             ambient_controls["save"]()
+            ambient_controls["cleanup"]()
 
         def close_display_settings():
             cleanup_display_settings()
@@ -1925,30 +2915,96 @@ class PopupPanel(QWidget):
         close_button.clicked.connect(close_display_settings)
         dialog.finished.connect(lambda result: cleanup_display_settings())
         dialog.finished.connect(lambda result: setattr(self, "_display_settings_dialog", None))
+        dialog.finished.connect(lambda result: setattr(self, "_display_settings_set_source_available", None))
 
-        def resize_for_tab(index):
-            if tabs.widget(index) is color_tab:
-                height = color_height
-            elif tabs.widget(index) is gamma_tab:
-                height = gamma_height
-            elif tabs.widget(index) is nightlight_curve_tab:
-                height = nightlight_curve_height
-            elif tabs.widget(index) is ambient_tab:
-                height = ambient_height
-            else:
-                height = light_height
+        def resize_for_page(index):
+            if index < 0 or index >= len(pages):
+                index = 0
+            height = max(min_settings_height, pages[index][3])
             dialog.setFixedSize(dialog_width, height)
 
-        tabs.currentChanged.connect(resize_for_tab)
+        def select_page(row):
+            item = page_list.item(row)
+            page_index = item.data(Qt.UserRole) if item is not None else None
+            if page_index is None:
+                for fallback_row in range(page_list.count()):
+                    fallback_item = page_list.item(fallback_row)
+                    fallback_index = fallback_item.data(Qt.UserRole) if fallback_item is not None else None
+                    if fallback_index is not None:
+                        page_list.setCurrentRow(fallback_row)
+                        return
+                return
+            page_stack.setCurrentIndex(page_index)
+            resize_for_page(page_index)
+
+        def remove_page(key):
+            removed_index = None
+            removed_widget = None
+            for index, (page_key, _, widget, _) in enumerate(pages):
+                if page_key == key:
+                    removed_index = index
+                    removed_widget = widget
+                    break
+            if removed_index is None:
+                return
+
+            was_current = page_stack.currentWidget() is removed_widget
+            page_stack.removeWidget(removed_widget)
+            pages.pop(removed_index)
+
+            for row in range(page_list.count() - 1, -1, -1):
+                item = page_list.item(row)
+                if item is not None and item.data(Qt.UserRole + 1) == key:
+                    page_list.takeItem(row)
+                    break
+
+            for row in range(page_list.count()):
+                item = page_list.item(row)
+                page_key = item.data(Qt.UserRole + 1) if item is not None else None
+                if page_key is None:
+                    continue
+                for index, (current_key, _, _, _) in enumerate(pages):
+                    if current_key == page_key:
+                        item.setData(Qt.UserRole, index)
+                        break
+
+            if was_current or page_list.currentItem() is None:
+                for row in range(page_list.count()):
+                    item = page_list.item(row)
+                    if item is not None and item.data(Qt.UserRole) is not None:
+                        page_list.setCurrentRow(row)
+                        select_page(row)
+                        break
+
+        def update_display_source_available(source, available):
+            if source == "ambient" and not available:
+                remove_page("ambient")
+
+        self._display_settings_set_source_available = update_display_source_available
+
+        page_list.currentRowChanged.connect(select_page)
+        initial_index = 0
         if initial_tab == "rgb":
-            tabs.setCurrentWidget(color_tab)
+            initial_tab = "nightlight_color"
+            nightlight_color_tabs.setCurrentWidget(color_tab)
         elif initial_tab == "gamma":
-            tabs.setCurrentWidget(gamma_tab)
+            initial_tab = "nightlight_color"
+            nightlight_color_tabs.setCurrentWidget(gamma_tab)
         elif initial_tab == "nightlight_curve":
-            tabs.setCurrentWidget(nightlight_curve_tab)
-        elif initial_tab == "ambient":
-            tabs.setCurrentWidget(ambient_tab)
-        QTimer.singleShot(0, lambda: resize_for_tab(tabs.currentIndex()))
+            initial_tab = "nightlight_color"
+            nightlight_color_tabs.setCurrentWidget(nightlight_curve_tab)
+        for index, (key, _, _, _) in enumerate(pages):
+            if key == initial_tab:
+                initial_index = index
+                break
+        initial_row = 0
+        for row in range(page_list.count()):
+            item = page_list.item(row)
+            if item is not None and item.data(Qt.UserRole) == initial_index:
+                initial_row = row
+                break
+        page_list.setCurrentRow(initial_row)
+        QTimer.singleShot(0, lambda: select_page(page_list.currentRow()))
         QTimer.singleShot(0, dialog.raise_)
         QTimer.singleShot(0, dialog.activateWindow)
         dialog.exec()
@@ -2039,9 +3095,11 @@ class PopupPanel(QWidget):
 
         general_label = QLabel("General")
         general_label.setStyleSheet("color: white; font-weight: bold;")
+        general_label.setFixedHeight(18)
         layout.addWidget(general_label)
 
         reset_rgb_button = QPushButton("Reset RGB monitor")
+        reset_rgb_button.setFixedHeight(28)
         reset_rgb_button.setStyleSheet("""
             QPushButton {
                 color: white;
@@ -2058,10 +3116,12 @@ class PopupPanel(QWidget):
 
         target_section_label = QLabel("Nightlight target color")
         target_section_label.setStyleSheet("color: white; font-weight: bold;")
+        target_section_label.setFixedHeight(18)
         layout.addWidget(target_section_label)
 
         preview_button = QPushButton("Preview OFF")
         preview_button.setCheckable(True)
+        preview_button.setFixedHeight(28)
         preview_button.setStyleSheet("""
             QPushButton {
                 color: white;
@@ -2078,6 +3138,7 @@ class PopupPanel(QWidget):
 
         color_label = QLabel()
         color_label.setStyleSheet("color: white;")
+        color_label.setFixedHeight(18)
         layout.addWidget(color_label)
 
         color_slider = QSlider(Qt.Orientation.Horizontal)
@@ -2172,6 +3233,8 @@ class PopupPanel(QWidget):
         button_row = QHBoxLayout()
         cancel_button = QPushButton("Cancel")
         apply_button = QPushButton("Apply")
+        cancel_button.setFixedHeight(28)
+        apply_button.setFixedHeight(28)
         button_row.addStretch()
         if include_cancel:
             button_row.addWidget(cancel_button)
@@ -2418,7 +3481,7 @@ class PopupPanel(QWidget):
             self.sliders[key].setValue(value)
 
     def set_source_control(self, source):
-        source = source if source in ("tray", "ambient", "daytime") else "tray"
+        source = source if source in ("tray", "ambient", "daytime") and source in self.available_sources else "tray"
         self.active_source = source
         if hasattr(self, "source_selector"):
             index = self.source_selector.findData(source)
@@ -2426,6 +3489,37 @@ class PopupPanel(QWidget):
                 self._updating_source_selector = True
                 self.source_selector.setCurrentIndex(index)
                 self._updating_source_selector = False
+
+    def set_source_available(self, source, available):
+        if source not in ("ambient", "daytime"):
+            return
+        if available:
+            self.available_sources.add(source)
+        else:
+            self.available_sources.discard(source)
+            if self.active_source == source:
+                self.active_source = "tray"
+        self._populate_source_selector()
+        self.set_source_control(self.active_source)
+        updater = getattr(self, "_display_settings_set_source_available", None)
+        if updater is not None:
+            updater(source, available)
+
+    def _populate_source_selector(self):
+        if not hasattr(self, "source_selector"):
+            return
+        self._updating_source_selector = True
+        current = self.active_source if self.active_source in self.available_sources else "tray"
+        self.source_selector.clear()
+        self.source_selector.addItem("Manual", "tray")
+        if "ambient" in self.available_sources:
+            self.source_selector.addItem("Sensor", "ambient")
+        if "daytime" in self.available_sources:
+            self.source_selector.addItem("Daytime", "daytime")
+        index = self.source_selector.findData(current)
+        self.source_selector.setCurrentIndex(index if index >= 0 else 0)
+        self.active_source = self.source_selector.currentData() or "tray"
+        self._updating_source_selector = False
 
     def set_nightlight_source_control(self, source):
         source = source if source in ("manual", "daytime", "light_linked") else "manual"
@@ -2486,10 +3580,20 @@ class PopupPanel(QWidget):
     def send_debounced(self, key):
         try:
             if key == "light":
-                brightness, contrast = self._light_to_brightness_contrast(self.sliders['light'].value())
-                self._set_slider_silent("brightness", brightness)
-                self._set_slider_silent("contrast", contrast)
-                self._safe_set_light_values(brightness, contrast)
+                value = self.sliders['light'].value()
+                if self._auto_curve_active():
+                    brightness, contrast = self._light_to_brightness_contrast(value)
+                    self._set_slider_silent("brightness", brightness)
+                    self._set_slider_silent("contrast", contrast)
+                    self._safe_set_light_values(brightness, contrast)
+                else:
+                    brightness = value
+                    self._set_slider_silent("brightness", brightness)
+                    submit_ddcci_command(
+                        "brightness",
+                        "Brightness set",
+                        lambda monitor=self.monitor, brightness=brightness: monitor.set_brightness(brightness),
+                    )
             elif key == "brightness":
                 value = self.sliders['brightness'].value()
                 submit_ddcci_command(

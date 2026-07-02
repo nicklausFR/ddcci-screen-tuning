@@ -11,4 +11,4 @@ dist/
 .agents/
 .codex/
 LOCAL_NOTES.md
-makeEXE.bat
+build_exe.py

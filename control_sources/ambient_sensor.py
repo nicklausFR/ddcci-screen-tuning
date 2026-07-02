@@ -3,7 +3,7 @@ import math
 import threading
 import time
 
-from ddcci_command_queue import submit_light_values
+from ddcci_command_queue import submit_ddcci_command, submit_light_values
 from ddcci_screen_tuning import config
 from monitor import DDCCI_Monitor, ddc_ci_monitors_list
 
@@ -11,22 +11,27 @@ from monitor import DDCCI_Monitor, ddc_ci_monitors_list
 class AmbientLightController:
     def __init__(self):
         self.monitor = None
+        self.apply_enabled = False
         self._last_applied_light = None
         self._last_light = None
         self._filtered_lux = None
-        self._last_measurement_at = None
         self._filtered_at = None
+        self._last_measurement_at = None
         self._last_raw_lux = None
         self._last_visible = None
         self._last_ir = None
         self._last_full = None
         self._last_saturated = None
+        self._last_quality = None
+        self._last_range = None
         self._last_brightness = None
         self._last_contrast = None
         self._lock = threading.Lock()
 
-    def on_measurement(self, lux, visible=None, ir=None, full=None, saturated=None):
-        saturated = bool(saturated)
+    def on_measurement(self, lux, visible=None, ir=None, full=None, saturated=None, quality=None, range_id=None):
+        quality = self._optional_int(quality)
+        saturated_value = self._optional_bool(saturated)
+        saturated = bool(saturated_value) or bool(quality is not None and quality & 1)
         try:
             lux = max(0.0, float(lux))
         except (TypeError, ValueError):
@@ -43,13 +48,19 @@ class AmbientLightController:
             self._last_ir = ir
             self._last_full = full
             self._last_saturated = saturated
+            self._last_quality = quality
+            self._last_range = range_id
             self._filtered_lux = self._smooth_lux(lux)
             light = self._lux_to_light(self._filtered_lux)
-            brightness, contrast = self._light_to_brightness_contrast(light)
+            if self._auto_curve_active():
+                brightness, contrast = self._light_to_brightness_contrast(light)
+            else:
+                brightness = light
+                contrast = self._last_contrast
             self._last_light = light
             self._last_brightness = brightness
             self._last_contrast = contrast
-            if self._should_apply(light):
+            if self.apply_enabled and self._should_apply(light):
                 self._apply_light(light, brightness, contrast)
 
     def status(self):
@@ -64,11 +75,31 @@ class AmbientLightController:
                 "ir": self._last_ir,
                 "full": self._last_full,
                 "saturated": self._last_saturated,
+                "quality": self._last_quality,
+                "range": self._last_range,
                 "age": age,
                 "light": self._last_light,
                 "brightness": self._last_brightness,
                 "contrast": self._last_contrast,
             }
+
+    def recalculate_current(self):
+        with self._lock:
+            lux = self._filtered_lux if self._filtered_lux is not None else self._last_raw_lux
+            if lux is None:
+                return False
+            light = self._lux_to_light(lux)
+            if self._auto_curve_active():
+                brightness, contrast = self._light_to_brightness_contrast(light)
+            else:
+                brightness = light
+                contrast = self._last_contrast
+            self._last_light = light
+            self._last_brightness = brightness
+            self._last_contrast = contrast
+            if self.apply_enabled and self._should_apply(light):
+                self._apply_light(light, brightness, contrast)
+            return True
 
     def close(self):
         if self.monitor is not None:
@@ -78,15 +109,25 @@ class AmbientLightController:
                 self.monitor = None
 
     def _smooth_lux(self, lux):
-        now = time.monotonic()
-        smoothing_seconds = self._config_float("AMBIENT_SMOOTHING_SECONDS", 2.0, 0.0, 60.0)
-        if self._filtered_lux is None or self._filtered_at is None or smoothing_seconds <= 0:
-            self._filtered_at = now
+        if not bool(getattr(config, "AMBIENT_SMOOTHING_ENABLED", True)):
+            self._filtered_at = time.monotonic()
             return lux
-        elapsed = max(0.001, now - self._filtered_at)
-        self._filtered_at = now
-        alpha = 1.0 - math.exp(-elapsed / smoothing_seconds)
-        return self._filtered_lux + (lux - self._filtered_lux) * alpha
+        mode = str(getattr(config, "AMBIENT_SMOOTHING_MODE", "steps"))
+        if mode == "time":
+            now = time.monotonic()
+            smoothing_seconds = self._config_float("AMBIENT_SMOOTHING_SECONDS", 2.0, 0.05, 120.0)
+            if self._filtered_lux is None or self._filtered_at is None:
+                self._filtered_at = now
+                return lux
+            elapsed = max(0.001, now - self._filtered_at)
+            self._filtered_at = now
+            alpha = 1.0 - math.exp(-elapsed / smoothing_seconds)
+            return self._filtered_lux + (lux - self._filtered_lux) * alpha
+        smoothing_steps = self._config_int("AMBIENT_SMOOTHING_STEPS", 4, 1, 100)
+        self._filtered_at = time.monotonic()
+        if self._filtered_lux is None or smoothing_steps <= 1:
+            return lux
+        return self._filtered_lux + (lux - self._filtered_lux) / smoothing_steps
 
     def _lux_to_light(self, lux):
         min_lux = self._config_float("AMBIENT_MIN_LUX", 5.0, 0.001, 100000.0)
@@ -95,7 +136,12 @@ class AmbientLightController:
         log_min = math.log10(min_lux)
         log_max = math.log10(max_lux)
         position = (math.log10(max(min_lux, min(lux, max_lux))) - log_min) / (log_max - log_min)
-        return round(100 * position)
+        normalized = 100 * position
+        points = self._curve_points(
+            "AMBIENT_LIGHT_CURVE_POINTS",
+            [0, 17, 33, 50, 67, 83, 100],
+        )
+        return round(self._curve_value(points, normalized))
 
     def _should_apply(self, light):
         threshold = self._config_int("AMBIENT_APPLY_THRESHOLD", 2, 0, 100)
@@ -105,13 +151,27 @@ class AmbientLightController:
 
     def _apply_light(self, light, brightness=None, contrast=None):
         monitor = self._monitor()
-        if brightness is None or contrast is None:
+        auto_curve_active = self._auto_curve_active()
+        if auto_curve_active and (brightness is None or contrast is None):
             brightness, contrast = self._light_to_brightness_contrast(light)
-        submit_light_values(monitor, brightness, contrast, "Ambient sensor light")
+        if auto_curve_active:
+            submit_light_values(monitor, brightness, contrast, "Ambient sensor light")
+        else:
+            brightness = max(0, min(100, round(light)))
+            submit_ddcci_command(
+                "brightness",
+                "Ambient sensor brightness",
+                lambda monitor=monitor, brightness=brightness: monitor.set_brightness(brightness),
+            )
+            contrast = self._last_contrast
         self._last_applied_light = light
         config.set("LAST_LIGHT", light)
         config.set("LAST_BRIGHTNESS", brightness)
-        config.set("LAST_CONTRAST", contrast)
+        if contrast is not None:
+            config.set("LAST_CONTRAST", contrast)
+
+    def _auto_curve_active(self):
+        return bool(getattr(config, "LIGHT_MODE", False)) and not bool(getattr(config, "DETAIL_ROWS_VISIBLE", True))
 
     def _monitor(self):
         if self.monitor is None:
@@ -181,14 +241,44 @@ class AmbientLightController:
             value = default
         return max(minimum, min(maximum, value))
 
+    def _optional_int(self, value):
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _optional_bool(self, value):
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        text = str(value).strip().lower()
+        if text in ("1", "true", "yes", "y", "on", "sat", "saturated", "overflow"):
+            return True
+        if text in ("0", "false", "no", "n", "off", "ok", "valid", "none"):
+            return False
+        return None
+
 
 class UsbSerialAmbientReader:
     def __init__(self, controller):
         self.controller = controller
         self.running = False
+        self.available = False
+        self.last_error = None
+        self.on_unavailable = None
         self.thread = None
         self.serial_port = None
         self.port_name = None
+        self._last_request_at = 0.0
+        self._last_config = None
+        self._last_config_at = None
+        self._last_config_error = None
+        self._write_lock = threading.Lock()
 
     def start(self):
         if self.running:
@@ -212,18 +302,46 @@ class UsbSerialAmbientReader:
             self.serial_port = serial.Serial(port, baudrate=baudrate, timeout=timeout)
             self.port_name = port
         except Exception as exc:
+            self.available = False
+            self.last_error = str(exc)
             print(f"[WARN] Ambient USB source failed to open {port}:", exc)
             return False
 
+        self.available = True
+        self.last_error = None
         self.running = True
         self.thread = threading.Thread(target=self._read_loop, daemon=True)
         self.thread.start()
+        self.apply_saved_config()
+        self.request_measurement(force=True)
         print(f"Ambient USB source connected on {port}.")
         return True
 
-    def _auto_detect_port(self, serial_module):
+    def is_port_available(self):
+        try:
+            import serial
+        except ImportError:
+            return False
+
+        port = str(getattr(config, "AMBIENT_USB_PORT", "") or "").strip()
+        if not port:
+            return self._auto_detect_port(serial, verbose=False) is not None
+
+        try:
+            try:
+                ports = list(serial.tools.list_ports.comports())
+            except AttributeError:
+                from serial.tools import list_ports
+                ports = list(list_ports.comports())
+        except Exception:
+            return True
+
+        return any(str(getattr(item, "device", "")).lower() == port.lower() for item in ports)
+
+    def _auto_detect_port(self, serial_module, verbose=True):
         if not bool(getattr(config, "AMBIENT_USB_AUTO_DETECT", True)):
-            print("[WARN] Ambient USB source enabled but AMBIENT_USB_PORT is empty.")
+            if verbose:
+                print("[WARN] Ambient USB source enabled but AMBIENT_USB_PORT is empty.")
             return None
 
         try:
@@ -233,11 +351,11 @@ class UsbSerialAmbientReader:
                 from serial.tools import list_ports
                 ports = list(list_ports.comports())
             except Exception as exc:
-                print("[WARN] Ambient USB auto-detect failed:", exc)
+                if verbose:
+                    print("[WARN] Ambient USB auto-detect failed:", exc)
                 return None
 
         if not ports:
-            print("[WARN] Ambient USB auto-detect found no serial ports.")
             return None
 
         hints = getattr(config, "AMBIENT_USB_PORT_HINTS", [])
@@ -259,21 +377,25 @@ class UsbSerialAmbientReader:
         matches = [port for port in ports if any(hint in port_text(port) for hint in hints)]
         if len(matches) == 1:
             device = matches[0].device
-            print(f"Ambient USB auto-detected {device}.")
+            if verbose:
+                print(f"Ambient USB auto-detected {device}.")
             return device
 
         if len(matches) > 1:
             devices = ", ".join(port.device for port in matches)
-            print(f"[WARN] Ambient USB auto-detect matched multiple ports: {devices}. Set AMBIENT_USB_PORT.")
+            if verbose:
+                print(f"[WARN] Ambient USB auto-detect matched multiple ports: {devices}. Set AMBIENT_USB_PORT.")
             return None
 
         if len(ports) == 1:
             device = ports[0].device
-            print(f"Ambient USB auto-detected the only serial port: {device}.")
+            if verbose:
+                print(f"Ambient USB auto-detected the only serial port: {device}.")
             return device
 
         devices = ", ".join(port.device for port in ports)
-        print(f"[WARN] Ambient USB auto-detect found multiple ports: {devices}. Set AMBIENT_USB_PORT.")
+        if verbose:
+            print(f"[WARN] Ambient USB auto-detect found multiple ports: {devices}. Set AMBIENT_USB_PORT.")
         return None
 
     def stop(self):
@@ -287,18 +409,89 @@ class UsbSerialAmbientReader:
             self.port_name = None
         self.controller.close()
 
+    def mark_unavailable(self, exc):
+        if not self.running and self.serial_port is None:
+            return
+        self.last_error = str(exc)
+        self.available = False
+        self.stop()
+        if self.on_unavailable is not None:
+            try:
+                self.on_unavailable(exc)
+            except Exception as callback_exc:
+                print("[WARN] Ambient USB unavailable callback failed:", callback_exc)
+
+    def request_measurement(self, force=False):
+        if self.serial_port is None:
+            return False
+        now = time.monotonic()
+        if not force and now - self._last_request_at < 1.0:
+            return False
+        try:
+            self._write_json({"cmd": "get"})
+            self._last_request_at = now
+            return True
+        except Exception as exc:
+            print("[WARN] Ambient USB request failed:", exc)
+            return False
+
+    def request_config(self):
+        try:
+            return self._write_json({"cmd": "config.get"})
+        except Exception as exc:
+            print("[WARN] Ambient USB config request failed:", exc)
+            return False
+
+    def apply_config(self, values):
+        payload = {"cmd": "config.set"}
+        payload.update(values)
+        try:
+            return self._write_json(payload)
+        except Exception as exc:
+            print("[WARN] Ambient USB config set failed:", exc)
+            return False
+
+    def reset_config(self):
+        try:
+            return self._write_json({"cmd": "config.reset"})
+        except Exception as exc:
+            print("[WARN] Ambient USB config reset failed:", exc)
+            return False
+
+    def apply_saved_config(self):
+        values = {
+            "refreshMs": self._config_int("AMBIENT_SENSOR_REFRESH_MS", 100, 50, 60000),
+            "publishLuxChangePercent": self._config_float("AMBIENT_SENSOR_PUBLISH_LUX_CHANGE_PERCENT", 1.0, 0.0, 100.0),
+            "publishMaxIntervalSeconds": self._config_int("AMBIENT_SENSOR_PUBLISH_MAX_INTERVAL_SECONDS", 30, 1, 86400),
+            "publishMode": self._config_publish_mode("AMBIENT_SENSOR_PUBLISH_MODE", "auto"),
+        }
+        return self.apply_config(values)
+
+    def _write_json(self, payload):
+        if self.serial_port is None:
+            return False
+        line = json.dumps(payload, separators=(",", ":")).encode("utf-8") + b"\n"
+        with self._write_lock:
+            self.serial_port.write(line)
+            self.serial_port.flush()
+        return True
+
     def _read_loop(self):
         while self.running:
             try:
                 line = self.serial_port.readline()
-                if not line:
-                    continue
+            except Exception as exc:
+                print("[WARN] Ambient USB read failed:", exc)
+                self.mark_unavailable(exc)
+                break
+            if not line:
+                continue
+            try:
                 payload = self._parse_line(line.decode("utf-8", errors="replace").strip())
                 if payload is not None:
                     self.controller.on_measurement(**payload)
             except Exception as exc:
-                print("[WARN] Ambient USB read failed:", exc)
-                time.sleep(1.0)
+                print("[WARN] Ambient USB line ignored:", exc)
 
     def _parse_line(self, line):
         if not line:
@@ -309,18 +502,177 @@ class UsbSerialAmbientReader:
             try:
                 return {"lux": float(line)}
             except ValueError:
-                print("[WARN] Ambient USB ignored line:", line)
-                return None
+                payload = self._parse_key_value_line(line) or self._parse_csv_line(line)
+                if payload is None:
+                    print("[WARN] Ambient USB ignored line:", line)
+                return payload
 
-        if not isinstance(data, dict) or "lux" not in data:
+        if isinstance(data, (int, float)):
+            return {"lux": float(data)}
+        if isinstance(data, str):
+            try:
+                return {"lux": float(data)}
+            except ValueError:
+                return None
+        if isinstance(data, (list, tuple)):
+            return self._payload_from_sequence(data)
+        if not isinstance(data, dict):
             return None
-        return {
-            "lux": data.get("lux"),
-            "visible": data.get("visible"),
-            "ir": data.get("ir"),
-            "full": data.get("full"),
-            "saturated": data.get("saturated"),
+
+        if self._handle_response(data):
+            return None
+        data = self._flatten_measurement_dict(data)
+        return self._payload_from_dict(data)
+
+    def _handle_response(self, data):
+        if data.get("type") != "response":
+            return False
+        cmd = data.get("cmd")
+        if data.get("ok") is False:
+            self._last_config_error = data.get("error") or "command_failed"
+            return True
+        if cmd in ("config.get", "config.set", "config.reset") and isinstance(data.get("config"), dict):
+            self._last_config = dict(data["config"])
+            self._last_config_at = time.monotonic()
+            self._last_config_error = None
+            self._sync_runtime_config(self._last_config)
+        return True
+
+    def _sync_runtime_config(self, runtime_config):
+        mapping = {
+            "refreshMs": "AMBIENT_SENSOR_REFRESH_MS",
+            "publishLuxChangePercent": "AMBIENT_SENSOR_PUBLISH_LUX_CHANGE_PERCENT",
+            "publishMaxIntervalSeconds": "AMBIENT_SENSOR_PUBLISH_MAX_INTERVAL_SECONDS",
+            "publishMode": "AMBIENT_SENSOR_PUBLISH_MODE",
         }
+        for source, target in mapping.items():
+            if source in runtime_config:
+                config._data[target] = runtime_config[source]
+                setattr(config, target, runtime_config[source])
+
+    def _flatten_measurement_dict(self, data):
+        for name in ("ambient", "als", "light", "sensor", "tsl", "tsl2591", "measurement", "m"):
+            nested = data.get(name)
+            if isinstance(nested, dict):
+                merged = dict(data)
+                merged.pop(name, None)
+                merged.update(nested)
+                return merged
+        return data
+
+    def _payload_from_dict(self, data):
+        if not isinstance(data, dict):
+            return None
+
+        def first(*names):
+            for name in names:
+                if name in data:
+                    return data.get(name)
+            return None
+
+        lux = first("lux", "lx", "l", "illuminance", "illum", "ambient_lux")
+        if lux is None:
+            lux_x100 = first("lux_x100", "lx100", "l100")
+            if lux_x100 is not None:
+                try:
+                    lux = float(lux_x100) / 100.0
+                except (TypeError, ValueError):
+                    lux = None
+        quality = first("q", "quality", "status", "flags", "flag")
+        if quality is None:
+            quality = self._quality_from_flags(data)
+        saturated = first("saturated", "sat", "overflow", "ovf", "clipped", "adcOverRange", "adc_over_range")
+        if saturated is None and quality is not None:
+            try:
+                saturated = bool(int(quality) & 1)
+            except (TypeError, ValueError):
+                saturated = False
+
+        if lux is None and not saturated:
+            return None
+
+        return {
+            "lux": lux,
+            "visible": first("visible", "vis", "v", "raw_visible", "ch_visible"),
+            "ir": first("ir", "i", "ch1", "raw_ir", "infrared"),
+            "full": first("full", "f", "ch0", "raw_full", "clear", "broadband"),
+            "saturated": saturated,
+            "quality": quality,
+            "range_id": first("r", "range", "range_id", "gain", "g", "cal", "calibration", "profile"),
+        }
+
+    def _quality_from_flags(self, data):
+        quality = 0
+        for bit, names in (
+            (0, ("saturated", "sat", "overflow", "ovf", "clipped", "adcOverRange", "adc_over_range")),
+            (1, ("spectral", "spectralOverload", "spectral_overload")),
+            (2, ("held", "hold")),
+            (3, ("estimated", "estimate", "estimatedLux")),
+        ):
+            if any(self._optional_bool(data.get(name)) for name in names if name in data):
+                quality |= 1 << bit
+        return quality if quality else None
+
+    def _payload_from_sequence(self, values):
+        if not values:
+            return None
+        if len(values) == 1:
+            return {"lux": values[0]}
+        if len(values) == 2:
+            return {"lux": values[0], "quality": values[1]}
+        if len(values) == 3:
+            return {"lux": values[0], "quality": values[1], "range_id": values[2]}
+        return {
+            "lux": values[0],
+            "visible": values[1],
+            "ir": values[2],
+            "full": values[3],
+            "quality": values[4] if len(values) > 4 else None,
+            "range_id": values[5] if len(values) > 5 else None,
+        }
+
+    def _parse_key_value_line(self, line):
+        tokens = line.replace(",", " ").replace(";", " ").split()
+        data = {}
+        for token in tokens:
+            if "=" in token:
+                key, value = token.split("=", 1)
+            elif ":" in token:
+                key, value = token.split(":", 1)
+            else:
+                continue
+            key = key.strip().lower()
+            value = value.strip()
+            if key:
+                data[key] = value
+        if not data:
+            return None
+        return self._payload_from_dict(data)
+
+    def _parse_csv_line(self, line):
+        if "," not in line and ";" not in line:
+            return None
+        separator = "," if "," in line else ";"
+        parts = [part.strip() for part in line.split(separator)]
+        try:
+            values = [float(part) for part in parts if part]
+        except ValueError:
+            return None
+        return self._payload_from_sequence(values)
+
+    def _optional_bool(self, value):
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        text = str(value).strip().lower()
+        if text in ("1", "true", "yes", "y", "on", "sat", "saturated", "overflow"):
+            return True
+        if text in ("0", "false", "no", "n", "off", "ok", "valid", "none", "null"):
+            return False
+        return None
 
     def _config_float(self, name, default, minimum, maximum):
         try:
@@ -336,33 +688,87 @@ class UsbSerialAmbientReader:
             value = default
         return max(minimum, min(maximum, value))
 
+    def _config_publish_mode(self, name, default):
+        value = str(getattr(config, name, default))
+        return value if value in ("auto", "interval") else default
+
 
 class AmbientSensorControlSource:
     def __init__(self):
         self.controller = AmbientLightController()
         self.reader = UsbSerialAmbientReader(self.controller)
 
+    def set_unavailable_callback(self, callback):
+        self.reader.on_unavailable = callback
+
     def start(self):
         if not bool(getattr(config, "AMBIENT_SOURCE_ENABLED", False)):
             return None
+        self.controller.apply_enabled = True
+        return self.reader.start()
+
+    def start_passive(self):
+        self.controller.apply_enabled = bool(getattr(config, "AMBIENT_SOURCE_ENABLED", False))
         return self.reader.start()
 
     def set_enabled(self, enabled):
         enabled = bool(enabled)
         config.set("AMBIENT_SOURCE_ENABLED", enabled)
+        self.controller.apply_enabled = enabled
         if enabled:
             return self.reader.start()
         self.stop()
         return True
 
     def stop(self):
+        self.controller.apply_enabled = False
         self.reader.stop()
+
+    def request_measurement(self, force=False):
+        if not self.reader.running:
+            if bool(getattr(config, "AMBIENT_SOURCE_ENABLED", False)):
+                return self.start()
+            return self.start_passive()
+        return self.reader.request_measurement(force=force)
+
+    def request_sensor_config(self):
+        if not self.reader.running:
+            if not self.start_passive():
+                return False
+        return self.reader.request_config()
+
+    def apply_sensor_config(self, values):
+        if not self.reader.running:
+            if not self.start_passive():
+                return False
+        return self.reader.apply_config(values)
+
+    def reset_sensor_config(self):
+        if not self.reader.running:
+            if not self.start_passive():
+                return False
+        return self.reader.reset_config()
 
     def is_running(self):
         return self.reader.running
+
+    def recalculate_current(self):
+        return self.controller.recalculate_current()
+
+    def is_available(self):
+        if self.reader.running or self.reader.available:
+            return True
+        if self.reader.last_error:
+            return False
+        return self.reader.is_port_available()
 
     def status(self):
         data = self.controller.status()
         data["running"] = self.reader.running
         data["port"] = self.reader.port_name
+        data["available"] = self.reader.available or self.reader.running
+        data["error"] = self.reader.last_error
+        data["sensor_config"] = self.reader._last_config
+        data["sensor_config_age"] = None if self.reader._last_config_at is None else time.monotonic() - self.reader._last_config_at
+        data["sensor_config_error"] = self.reader._last_config_error
         return data
