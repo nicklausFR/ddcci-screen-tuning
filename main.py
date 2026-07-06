@@ -1,11 +1,19 @@
 import signal
 import sys
 import platform
+import tempfile
+from pathlib import Path
 
+from PySide6.QtCore import QLockFile
 from PySide6.QtWidgets import QApplication
 
 from control_sources import AmbientSensorControlSource, TrayControlSource
 
+
+instance_lock = QLockFile(str(Path(tempfile.gettempdir()) / "ddcci-screen-tuning.lock"))
+if not instance_lock.tryLock(0):
+    print("[WARN] ddcci-screen-tuning is already running.")
+    sys.exit(0)
 
 app = QApplication(sys.argv)
 app.setQuitOnLastWindowClosed(False)

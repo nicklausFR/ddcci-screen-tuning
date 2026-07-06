@@ -1,5 +1,6 @@
 import json
 import math
+import re
 import threading
 import time
 
@@ -32,13 +33,15 @@ class AmbientLightController:
         quality = self._optional_int(quality)
         saturated_value = self._optional_bool(saturated)
         saturated = bool(saturated_value) or bool(quality is not None and quality & 1)
+        lux_was_invalid = False
         try:
             lux = max(0.0, float(lux))
         except (TypeError, ValueError):
             if not saturated:
                 return
+            lux_was_invalid = True
             lux = self._config_float("AMBIENT_MAX_LUX", 500.0, 0.001, 100000.0)
-        if saturated:
+        if saturated and lux_was_invalid:
             lux = max(lux, self._config_float("AMBIENT_MAX_LUX", 500.0, 0.001, 100000.0))
 
         with self._lock:
@@ -65,6 +68,7 @@ class AmbientLightController:
 
     def status(self):
         with self._lock:
+            self._settle_filtered_lux()
             age = None
             if self._last_measurement_at is not None:
                 age = time.monotonic() - self._last_measurement_at
@@ -88,17 +92,7 @@ class AmbientLightController:
             lux = self._filtered_lux if self._filtered_lux is not None else self._last_raw_lux
             if lux is None:
                 return False
-            light = self._lux_to_light(lux)
-            if self._auto_curve_active():
-                brightness, contrast = self._light_to_brightness_contrast(light)
-            else:
-                brightness = light
-                contrast = self._last_contrast
-            self._last_light = light
-            self._last_brightness = brightness
-            self._last_contrast = contrast
-            if self.apply_enabled and self._should_apply(light):
-                self._apply_light(light, brightness, contrast)
+            self._update_light_from_lux(lux)
             return True
 
     def close(self):
@@ -128,6 +122,61 @@ class AmbientLightController:
         if self._filtered_lux is None or smoothing_steps <= 1:
             return lux
         return self._filtered_lux + (lux - self._filtered_lux) / smoothing_steps
+
+    def _settle_filtered_lux(self):
+        if self._last_raw_lux is None or self._filtered_lux is None:
+            return
+        if not bool(getattr(config, "AMBIENT_SMOOTHING_ENABLED", True)):
+            if self._filtered_lux != self._last_raw_lux:
+                self._filtered_lux = self._last_raw_lux
+                self._update_light_from_lux(self._filtered_lux)
+            self._filtered_at = time.monotonic()
+            return
+
+        now = time.monotonic()
+        if self._filtered_at is None:
+            self._filtered_at = now
+            return
+        elapsed = now - self._filtered_at
+        if elapsed <= 0:
+            return
+
+        previous = self._filtered_lux
+        mode = str(getattr(config, "AMBIENT_SMOOTHING_MODE", "steps"))
+        if mode == "time":
+            smoothing_seconds = self._config_float("AMBIENT_SMOOTHING_SECONDS", 2.0, 0.05, 120.0)
+            alpha = 1.0 - math.exp(-elapsed / smoothing_seconds)
+            self._filtered_lux += (self._last_raw_lux - self._filtered_lux) * alpha
+            self._filtered_at = now
+        else:
+            refresh_seconds = self._config_float("AMBIENT_SENSOR_REFRESH_MS", 100, 50, 60000) / 1000.0
+            smoothing_steps = self._config_int("AMBIENT_SMOOTHING_STEPS", 4, 1, 100)
+            if smoothing_steps <= 1:
+                self._filtered_lux = self._last_raw_lux
+                self._filtered_at = now
+            else:
+                virtual_steps = max(0.0, elapsed / refresh_seconds)
+                alpha = 1.0 - ((smoothing_steps - 1.0) / smoothing_steps) ** virtual_steps
+                self._filtered_lux += (self._last_raw_lux - self._filtered_lux) * alpha
+                self._filtered_at = now
+
+        if abs(self._filtered_lux - self._last_raw_lux) < 0.001:
+            self._filtered_lux = self._last_raw_lux
+        if self._filtered_lux != previous:
+            self._update_light_from_lux(self._filtered_lux)
+
+    def _update_light_from_lux(self, lux):
+        light = self._lux_to_light(lux)
+        if self._auto_curve_active():
+            brightness, contrast = self._light_to_brightness_contrast(light)
+        else:
+            brightness = light
+            contrast = self._last_contrast
+        self._last_light = light
+        self._last_brightness = brightness
+        self._last_contrast = contrast
+        if self.apply_enabled and self._should_apply(light):
+            self._apply_light(light, brightness, contrast)
 
     def _lux_to_light(self, lux):
         min_lux = self._config_float("AMBIENT_MIN_LUX", 5.0, 0.001, 100000.0)
@@ -499,6 +548,17 @@ class UsbSerialAmbientReader:
         try:
             data = json.loads(line)
         except json.JSONDecodeError:
+            cleaned_line = re.sub(
+                r"(:\s*)([-+]?inf(?:inity)?|nan)(?=\s*[,}])",
+                r"\1null",
+                line,
+                flags=re.IGNORECASE,
+            )
+            if cleaned_line != line:
+                try:
+                    return self._payload_from_json_data(json.loads(cleaned_line))
+                except json.JSONDecodeError:
+                    pass
             try:
                 return {"lux": float(line)}
             except ValueError:
@@ -507,6 +567,9 @@ class UsbSerialAmbientReader:
                     print("[WARN] Ambient USB ignored line:", line)
                 return payload
 
+        return self._payload_from_json_data(data)
+
+    def _payload_from_json_data(self, data):
         if isinstance(data, (int, float)):
             return {"lux": float(data)}
         if isinstance(data, str):
