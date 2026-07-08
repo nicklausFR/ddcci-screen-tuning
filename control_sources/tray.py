@@ -408,17 +408,12 @@ class TrayControlSource:
             print("[WARN] Failed to apply Tray values:", e)
 
     def _daytime_light_value(self, now=None):
-        min_light = int(getattr(config, "DAYTIME_MIN_LIGHT", 18))
-        max_light = int(getattr(config, "DAYTIME_MAX_LIGHT", 88))
-        min_light = max(0, min(100, min_light))
-        max_light = max(min_light, min(100, max_light))
         daytime_position = self._daytime_position(now)
         curve = self._curve_points(
             "DAYTIME_LIGHT_CURVE_POINTS",
             [18, 28, 55, 100, 55, 28, 18],
         )
-        curved_position = self._curve_value(curve, daytime_position) / 100.0
-        return round(min_light + (max_light - min_light) * curved_position)
+        return round(self._curve_value(curve, daytime_position))
 
     def _daytime_color_value(self, now=None):
         daytime_position = self._daytime_position(now)
