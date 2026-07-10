@@ -146,8 +146,8 @@ class AmbientLuxGraph(QWidget):
         super().__init__(parent)
         self.samples = []
         self.window_seconds = 10.0
-        self.lux_zero = 5.0
-        self.lux_full = 500.0
+        self.lux_zero = 0.1
+        self.lux_full = 1000.0
         self.current_lux = None
         self.current_filtered_lux = None
         self.current_saturated = False
@@ -205,10 +205,12 @@ class AmbientLuxGraph(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        rect = self.rect().adjusted(28, 14, -122, -28)
+        rect = self.rect().adjusted(42, 14, -58, -28)
         painter.fillRect(self.rect(), QColor("#202020"))
         painter.setPen(QPen(QColor("#555"), 1))
         painter.drawRect(rect)
+        painter.setPen(QPen(QColor("#aaa"), 1))
+        painter.drawText(2, 2, 38, 12, Qt.AlignLeft | Qt.AlignVCenter, "Lux")
 
         now = time.monotonic()
         visible_samples = [sample for sample in self.samples if sample[0] >= now - self.window_seconds]
@@ -218,19 +220,8 @@ class AmbientLuxGraph(QWidget):
             if filtered is not None:
                 values.append(filtered)
         min_positive = self._min_positive
-        log_values = [math.log10(max(min_positive, value)) for value in values]
-        y_min = min(log_values)
-        y_max = max(log_values)
-        zero_log = math.log10(max(min_positive, self.lux_zero))
-        full_log = math.log10(max(min_positive, self.lux_full))
-        threshold_span = max(0.001, full_log - zero_log)
-        y_min = min(y_min, zero_log - max(0.22, threshold_span * 0.18))
-        y_max = max(y_max, full_log + max(0.16, threshold_span * 0.10))
-        padding = max(0.12, (y_max - y_min) * 0.12)
-        y_min -= padding
-        y_max += padding
-        if y_max <= y_min:
-            y_max = y_min + 1.0
+        y_min = math.log10(0.1)
+        y_max = math.log10(1000.0)
         self._plot_rect = rect
         self._y_min_log = y_min
         self._y_max_log = y_max
@@ -248,24 +239,14 @@ class AmbientLuxGraph(QWidget):
             for multiplier in range(1, 10):
                 value = multiplier * (10 ** exponent)
                 y = y_for(value)
-                if rect.top() <= y <= rect.bottom():
+                if rect.top() - 1 <= y <= rect.bottom() + 1:
                     color = QColor("#505050") if multiplier == 1 else QColor("#333333")
                     painter.setPen(QPen(color, 1))
                     painter.drawLine(rect.left(), round(y), rect.right(), round(y))
                     if multiplier == 1:
                         painter.setPen(QPen(QColor("#8a8a8a"), 1))
-                        painter.drawText(0, round(y) - 6, 24, 12, Qt.AlignRight | Qt.AlignVCenter, self._format_lux(value).replace(" lx", ""))
-
-        for value, text, color in (
-            (self.lux_zero, "min", QColor("#64b5f6")),
-            (self.lux_full, "max", QColor("#ffb74d")),
-        ):
-            y = y_for(value)
-            painter.setPen(QPen(color, 1, Qt.DashLine))
-            painter.drawLine(rect.left(), round(y), rect.right(), round(y))
-            painter.drawText(rect.right() + 6, round(y) + 4, text)
-
-        self._position_threshold_edits(y_for)
+                        label_y = max(rect.top(), min(rect.bottom() - 12, round(y) - 6))
+                        painter.drawText(0, label_y, 38, 12, Qt.AlignRight | Qt.AlignVCenter, self._format_lux(value).replace(" lx", ""))
 
         painter.setPen(QPen(QColor("#aaa"), 1))
         painter.drawText(rect.left(), self.height() - 8, "10s")
@@ -311,7 +292,7 @@ class AmbientLuxGraph(QWidget):
                 continue
             y = round(y_for(value))
             y = max(18, min(self.height() - 42, y - 11))
-            edit.setGeometry(self._plot_rect.right() + 34, y, 72, 22)
+            edit.setGeometry(self._plot_rect.right() + 92, y, 72, 22)
 
     def _y_for_lux(self, value):
         if self._plot_rect is None:
@@ -483,7 +464,7 @@ class CurveEditor(QWidget):
             y = rect.top() + rect.height() * i / 5
             painter.drawLine(rect.left(), round(y), rect.right(), round(y))
         if self.x_tick_labels:
-            grid_values = [0, 1, 2, 3, 5, 7, 10, 15, 20, 30, 40, 50, 70, 85, 100]
+            grid_values = sorted(set(self.x_tick_labels) | {12.5, 37.5, 62.5, 87.5})
             for value in grid_values:
                 x = self._x_for_value(rect, value)
                 color = QColor(75, 75, 75) if value in self.x_tick_labels else QColor(50, 50, 50)
@@ -507,7 +488,16 @@ class CurveEditor(QWidget):
         if self.x_tick_labels:
             for value, label in self.x_tick_labels.items():
                 x = self._x_for_value(rect, value)
-                painter.drawText(round(x) - 28, rect.bottom() + 6, 56, 14, Qt.AlignCenter, label)
+                if value <= 0:
+                    label_rect = (round(x), rect.bottom() + 6, 64, 14)
+                    alignment = Qt.AlignLeft | Qt.AlignVCenter
+                elif value >= 100:
+                    label_rect = (round(x) - 64, rect.bottom() + 6, 64, 14)
+                    alignment = Qt.AlignRight | Qt.AlignVCenter
+                else:
+                    label_rect = (round(x) - 32, rect.bottom() + 6, 64, 14)
+                    alignment = Qt.AlignCenter
+                painter.drawText(*label_rect, alignment, label)
         else:
             for index, label in enumerate(self.x_labels):
                 value = 100 * index / (len(self.x_labels) - 1)
@@ -2230,35 +2220,31 @@ class PopupPanel(QWidget):
         }
         sensor_config_pending = {"values": None}
 
-        min_lux_edit = QLineEdit(str(self._ambient_config_float("AMBIENT_MIN_LUX", 5.0, 0.001, 100000.0)))
-        max_lux_edit = QLineEdit(str(self._ambient_config_float("AMBIENT_MAX_LUX", 500.0, 0.001, 100000.0)))
-        for edit in (min_lux_edit, max_lux_edit):
-            edit.setFixedWidth(72)
-            edit.setStyleSheet(field_style)
-
-        layout.addWidget(label("Calibration", bold=True))
+        min_lux = 0.1
+        max_lux = 1000.0
+        scale_note = label("Logarithmic lux scale: each interval = 10x")
+        scale_note.setStyleSheet("color: #aaa;")
+        layout.addWidget(scale_note)
         graph_row = QHBoxLayout()
         graph = AmbientLuxGraph()
-        graph.set_threshold_edits(min_lux_edit, max_lux_edit)
         graph_row.addWidget(graph, 1)
         layout.addLayout(graph_row)
 
         ambient_curve_points = self._validated_curve_points(getattr(self.config, "AMBIENT_LIGHT_CURVE_POINTS", None))
         if ambient_curve_points is None:
             ambient_curve_points = [0, 17, 33, 50, 67, 83, 100]
-        curve_label = label("Lux -> screen light (exponential lux scale)", bold=True)
+        curve_label = label("Ambient lux -> screen light", bold=True)
         curve_editor = CurveEditor(
             ambient_curve_points,
             y_label="Screen light",
             y_tick_labels={0: "0%", 50: "50%", 100: "100%"},
-            x_display_exponent=0.5,
-            x_tick_labels={0: "Lux 0%", 10: "10%", 30: "30%", 100: "100%"},
+            x_display_exponent=1.0,
+            x_tick_labels={0: "0.1 lx", 25: "1 lx", 50: "10 lx", 75: "100 lx", 100: "1000 lx"},
         )
         curve_editor.setMinimumHeight(175)
         layout.addWidget(curve_label)
         layout.addWidget(curve_editor)
         layout.addStretch()
-        updating_thresholds = {"active": False}
 
         def normalized_lux(lux, min_lux, max_lux):
             try:
@@ -2271,6 +2257,16 @@ class PopupPanel(QWidget):
                 return None
             clamped_lux = max(min_lux, min(lux, max_lux))
             return (math.log10(clamped_lux) - log_min) / (log_max - log_min) * 100
+
+        def update_curve_lux_labels(min_lux, max_lux):
+            curve_editor.x_tick_labels = {
+                0: "0.1 lx",
+                25: "1 lx",
+                50: "10 lx",
+                75: "100 lx",
+                100: "1000 lx",
+            }
+            curve_editor.update()
 
         def parse_float(edit, fallback, minimum, maximum):
             try:
@@ -2335,45 +2331,8 @@ class PopupPanel(QWidget):
             return values
 
         def save_settings():
-            min_lux = parse_float(min_lux_edit, 5.0, 0.001, 100000.0)
-            max_lux = parse_float(max_lux_edit, 500.0, min_lux + 0.001, 100000.0)
-            min_lux_edit.setText(f"{min_lux:g}")
-            max_lux_edit.setText(f"{max_lux:g}")
-            self.config.set("AMBIENT_MIN_LUX", min_lux)
-            self.config.set("AMBIENT_MAX_LUX", max_lux)
             self.config.set("AMBIENT_LIGHT_CURVE_POINTS", list(curve_editor.points))
-            if not updating_thresholds["active"]:
-                graph.set_thresholds(min_lux, max_lux)
-
-        def apply_lux_threshold_fields(normalize_text=False):
-            if updating_thresholds["active"]:
-                return
-            try:
-                min_lux = float(min_lux_edit.text().replace(",", "."))
-                max_lux = float(max_lux_edit.text().replace(",", "."))
-            except ValueError:
-                return
-            min_lux = max(0.001, min(min_lux, 100000.0))
-            max_lux = max(min_lux + 0.001, min(max_lux, 100000.0))
-            if normalize_text:
-                min_lux_edit.setText(f"{min_lux:g}")
-                max_lux_edit.setText(f"{max_lux:g}")
-            self.config._data["AMBIENT_MIN_LUX"] = min_lux
-            self.config._data["AMBIENT_MAX_LUX"] = max_lux
-            self.config.AMBIENT_MIN_LUX = min_lux
-            self.config.AMBIENT_MAX_LUX = max_lux
-            graph.set_thresholds(min_lux, max_lux)
-            if self.ambient_source is not None:
-                self.ambient_source.recalculate_current()
-            status = self.ambient_source.status() if self.ambient_source is not None else {}
-            current_x = normalized_lux(status.get("filtered_lux") or status.get("lux"), min_lux, max_lux)
-            curve_editor.current_x = current_x
-            curve_editor.current_y = (
-                self._curve_value_from_points(curve_editor.points, current_x)
-                if current_x is not None
-                else None
-            )
-            curve_editor.update()
+            update_curve_lux_labels(min_lux, max_lux)
 
         def update_curve_live(points):
             points = list(points)
@@ -2426,31 +2385,14 @@ class PopupPanel(QWidget):
                 sensor_config_pending["values"] = None
                 set_sensor_config_fields(sensor_config_last["values"])
                 sensor_status_label.setText(str(status.get("sensor_config_error")))
-            if graph._dragging is None:
-                min_lux = self._ambient_config_float("AMBIENT_MIN_LUX", 5.0, 0.001, 100000.0)
-                max_lux = self._ambient_config_float("AMBIENT_MAX_LUX", 500.0, 0.001, 100000.0)
-                graph.set_thresholds(min_lux, max_lux)
-                current_x = normalized_lux(status.get("filtered_lux") or status.get("lux"), min_lux, max_lux)
-                curve_editor.current_x = current_x
-                if current_x is not None:
-                    curve_editor.current_y = self._curve_value_from_points(curve_editor.points, current_x)
-                else:
-                    curve_editor.current_y = None
-                curve_editor.update()
+            current_x = normalized_lux(status.get("filtered_lux") or status.get("lux"), min_lux, max_lux)
+            curve_editor.current_x = current_x
+            if current_x is not None:
+                curve_editor.current_y = self._curve_value_from_points(curve_editor.points, current_x)
+            else:
+                curve_editor.current_y = None
+            curve_editor.update()
             graph.add_sample(status.get("lux"), status.get("filtered_lux"), status.get("saturated"))
-
-        def graph_thresholds_changed(min_lux, max_lux):
-            updating_thresholds["active"] = True
-            min_lux_edit.setText(f"{min_lux:.3g}")
-            max_lux_edit.setText(f"{max_lux:.3g}")
-            self.config.set("AMBIENT_MIN_LUX", min_lux)
-            self.config.set("AMBIENT_MAX_LUX", max_lux)
-            if self.ambient_source is not None:
-                self.ambient_source.recalculate_current()
-            updating_thresholds["active"] = False
-            refresh_status()
-
-        graph.thresholds_changed.connect(graph_thresholds_changed)
         curve_editor.points_changed.connect(update_curve_live)
         curve_editor.point_edit_finished.connect(save_curve)
         sensor_refresh_edit.editingFinished.connect(save_sensor_config)
@@ -2462,10 +2404,6 @@ class PopupPanel(QWidget):
 
         sensor_mode_combo.currentIndexChanged.connect(sensor_mode_changed)
         update_sensor_config_visibility()
-        min_lux_edit.textEdited.connect(lambda text: apply_lux_threshold_fields(False))
-        max_lux_edit.textEdited.connect(lambda text: apply_lux_threshold_fields(False))
-        min_lux_edit.editingFinished.connect(lambda: (apply_lux_threshold_fields(True), save_settings(), refresh_status()))
-        max_lux_edit.editingFinished.connect(lambda: (apply_lux_threshold_fields(True), save_settings(), refresh_status()))
 
         status_timer = QTimer(parent)
         status_timer.timeout.connect(refresh_status)
