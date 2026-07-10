@@ -11,7 +11,7 @@ from ddcci_screen_tuning import config
 from ddcci_command_queue import submit_ddcci_command, submit_light_values
 from daytime import daytime_position, solar_hours
 from PySide6.QtCore import QObject, QTimer, Signal
-from PySide6.QtWidgets import QComboBox, QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout
+from PySide6.QtWidgets import QCheckBox, QComboBox, QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout
 import datetime
 import math
 import platform
@@ -62,6 +62,7 @@ class TrayControlSource:
         self.tray_icon = create_tray_icon(
             self.show_active_source_window,
             self.open_configuration,
+            self.open_general_settings,
             self.open_daytime_settings,
             self.select_source,
             self._active_source_name(),
@@ -352,6 +353,33 @@ class TrayControlSource:
 
     def open_configuration(self):
         QTimer.singleShot(0, self._open_configuration_now)
+
+    def open_general_settings(self):
+        dialog = QDialog()
+        dialog.setWindowTitle("General settings")
+        dialog.setFixedSize(340, 120)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(14, 14, 14, 12)
+        layout.setSpacing(12)
+
+        reset_checkbox = QCheckBox("Reset displays to 50% on exit")
+        reset_checkbox.setChecked(bool(getattr(config, "RESET_DISPLAYS_ON_EXIT", False)))
+        reset_checkbox.setStyleSheet("color: white;")
+        layout.addWidget(reset_checkbox)
+
+        button_row = QHBoxLayout()
+        close_button = QPushButton("Close")
+        button_row.addStretch()
+        button_row.addWidget(close_button)
+        layout.addLayout(button_row)
+
+        def save_settings():
+            config.set("RESET_DISPLAYS_ON_EXIT", reset_checkbox.isChecked())
+
+        reset_checkbox.stateChanged.connect(lambda _state: save_settings())
+        close_button.clicked.connect(lambda: (save_settings(), dialog.accept()))
+        dialog.exec()
 
     def _open_configuration_now(self):
         panel = self._ensure_panel()

@@ -25,6 +25,10 @@ class DDCCommandQueue:
             self._pending[key] = (label, callback)
             self._condition.notify()
 
+    def clear_pending(self):
+        with self._condition:
+            self._pending.clear()
+
     def _block_after_failure(self, key, label, error):
         now = time.monotonic()
         warning_interval = 2.0
@@ -54,6 +58,10 @@ ddc_command_queue = DDCCommandQueue()
 
 def submit_ddcci_command(key, label, callback):
     ddc_command_queue.submit(key, label, callback)
+
+
+def clear_pending_ddcci_commands():
+    ddc_command_queue.clear_pending()
 
 
 def submit_light_values(monitor, brightness, contrast, label="Auto curve"):

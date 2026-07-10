@@ -3656,6 +3656,7 @@ class PopupPanel(QWidget):
 def create_tray_icon(
     on_triggered,
     on_configuration=None,
+    on_general_settings=None,
     on_daytime_settings=None,
     on_source_selected=None,
     active_source="tray",
@@ -3704,6 +3705,10 @@ def create_tray_icon(
     if on_configuration is not None:
         config_action.triggered.connect(on_configuration)
     tray_menu.addAction(config_action)
+    general_action = QAction("General settings", tray_menu)
+    if on_general_settings is not None:
+        general_action.triggered.connect(on_general_settings)
+    tray_menu.addAction(general_action)
     tray_menu.addSeparator()
     quit_action = QAction("Quit", tray_menu)
     quit_action.triggered.connect(QApplication.instance().quit)
