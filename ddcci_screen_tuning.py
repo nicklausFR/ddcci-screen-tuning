@@ -6,6 +6,7 @@ import yaml
 
 
 DEFAULT_CONFIG = {
+    "APP_THEME": "auto",
     "SLIDER_DEBOUNCE": 0.1,
     "DDCCI_COMMAND_DELAY": 0.15,
     "BRIGHTNESS_RANGE": [0, 100],

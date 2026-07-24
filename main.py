@@ -21,6 +21,10 @@ if not instance_lock.tryLock(0):
 app = QApplication(sys.argv)
 app.setQuitOnLastWindowClosed(False)
 
+from gui import apply_windows_app_theme
+
+apply_windows_app_theme(app)
+
 _shutdown_reset_done = False
 
 
