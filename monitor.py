@@ -276,6 +276,31 @@ def ddc_ci_monitors_list():
     return _monitor_backend().list_monitors()
 
 
+def reset_all_monitors_to_neutral(brightness=50, contrast=50, rgb=(50, 50, 50)):
+    brightness = max(0, min(100, round(brightness)))
+    contrast = max(0, min(100, round(contrast)))
+    rgb = tuple(max(0, min(100, int(channel))) for channel in rgb)
+
+    monitors = ddc_ci_monitors_list()
+    if not monitors:
+        print("[WARN] No DDC/CI monitor detected for shutdown reset.")
+        return
+
+    for index, name in enumerate(monitors):
+        try:
+            with DDCCI_Monitor(index=index, cache_ttl=0) as monitor:
+                monitor.set_light_values(brightness, contrast)
+                try:
+                    delay = max(0.0, float(getattr(config, "DDCCI_COMMAND_DELAY", 0.15)))
+                except (TypeError, ValueError):
+                    delay = 0.15
+                if delay > 0:
+                    time.sleep(delay)
+                monitor.set_rgb(*rgb)
+        except Exception as exc:
+            print(f"[WARN] Shutdown reset failed for monitor {index} ({name}):", exc)
+
+
 def _print_monitor_diagnostics():
     monitors = ddc_ci_monitors_list()
     if not monitors:

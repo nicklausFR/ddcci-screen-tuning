@@ -40,9 +40,9 @@ class AmbientLightController:
             if not saturated:
                 return
             lux_was_invalid = True
-            lux = self._config_float("AMBIENT_MAX_LUX", 500.0, 0.001, 100000.0)
+            lux = 10000.0
         if saturated and lux_was_invalid:
-            lux = max(lux, self._config_float("AMBIENT_MAX_LUX", 500.0, 0.001, 100000.0))
+            lux = max(lux, 10000.0)
 
         with self._lock:
             self._last_measurement_at = time.monotonic()
@@ -179,8 +179,8 @@ class AmbientLightController:
             self._apply_light(light, brightness, contrast)
 
     def _lux_to_light(self, lux):
-        min_lux = self._config_float("AMBIENT_MIN_LUX", 5.0, 0.001, 100000.0)
-        max_lux = self._config_float("AMBIENT_MAX_LUX", 500.0, min_lux + 0.001, 100000.0)
+        min_lux = 0.1
+        max_lux = 10000.0
 
         log_min = math.log10(min_lux)
         log_max = math.log10(max_lux)

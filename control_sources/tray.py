@@ -10,8 +10,8 @@ from monitor import DDCCI_Monitor, ddc_ci_monitors_list
 from ddcci_screen_tuning import config
 from ddcci_command_queue import submit_ddcci_command, submit_light_values
 from daytime import daytime_position, solar_hours
-from PySide6.QtCore import QObject, QTimer, Signal
-from PySide6.QtWidgets import QComboBox, QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout
+from PySide6.QtCore import QObject, QTimer, Signal, Qt
+from PySide6.QtWidgets import QApplication, QCheckBox, QComboBox, QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout
 import datetime
 import math
 import platform
@@ -62,6 +62,7 @@ class TrayControlSource:
         self.tray_icon = create_tray_icon(
             self.show_active_source_window,
             self.open_configuration,
+            self.open_general_settings,
             self.open_daytime_settings,
             self.select_source,
             self._active_source_name(),
@@ -352,6 +353,70 @@ class TrayControlSource:
 
     def open_configuration(self):
         QTimer.singleShot(0, self._open_configuration_now)
+
+    def open_general_settings(self):
+        dialog = QDialog()
+        dialog.setWindowTitle("General settings")
+        dialog.setFixedSize(340, 165)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(14, 14, 14, 12)
+        layout.setSpacing(12)
+
+        reset_checkbox = QCheckBox("Reset displays to 50% on exit")
+        reset_checkbox.setChecked(bool(getattr(config, "RESET_DISPLAYS_ON_EXIT", False)))
+        reset_checkbox.setStyleSheet("color: palette(window-text);")
+        layout.addWidget(reset_checkbox)
+
+        theme_row = QHBoxLayout()
+        theme_row.setContentsMargins(0, 0, 0, 0)
+        theme_row.setSpacing(0)
+        theme_row.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        theme_label = QLabel("Theme")
+        theme_label.setStyleSheet("color: palette(window-text);")
+        theme_label.setFixedWidth(theme_label.sizeHint().width())
+        theme_combo = QComboBox()
+        theme_combo.addItem("Automatic (Windows)", "auto")
+        theme_combo.addItem("Light", "light")
+        theme_combo.addItem("Dark", "dark")
+        current_theme = str(getattr(config, "APP_THEME", "auto")).strip().lower()
+        theme_combo.setCurrentIndex(max(0, theme_combo.findData(current_theme)))
+        theme_combo.setStyleSheet(
+            "color: palette(window-text); background: palette(base); "
+            "border: 1px solid palette(mid); border-radius: 4px; padding: 3px;"
+        )
+        theme_combo.setFixedWidth(theme_combo.sizeHint().width())
+        theme_row.addWidget(theme_label)
+        theme_row.addSpacing(12)
+        theme_row.addWidget(theme_combo)
+        layout.addLayout(theme_row)
+
+        button_row = QHBoxLayout()
+        close_button = QPushButton("Close")
+        button_row.addStretch()
+        button_row.addWidget(close_button)
+        layout.addLayout(button_row)
+
+        def save_settings():
+            config.set("RESET_DISPLAYS_ON_EXIT", reset_checkbox.isChecked())
+            config.set("APP_THEME", theme_combo.currentData())
+
+        def apply_theme():
+            config.set("APP_THEME", theme_combo.currentData())
+            app = QApplication.instance()
+            refresh_palette = getattr(app, "_apply_windows_theme", None)
+            if refresh_palette is not None:
+                refresh_palette()
+            if self.tray_icon is not None and hasattr(self.tray_icon, "refresh_theme_icon"):
+                self.tray_icon.refresh_theme_icon()
+            if self.panel is not None:
+                self.panel.close()
+                self.panel = None
+
+        reset_checkbox.stateChanged.connect(lambda _state: save_settings())
+        theme_combo.currentIndexChanged.connect(lambda _index: apply_theme())
+        close_button.clicked.connect(lambda: (save_settings(), dialog.accept()))
+        dialog.exec()
 
     def _open_configuration_now(self):
         panel = self._ensure_panel()
@@ -679,11 +744,11 @@ class TrayControlSource:
         template_combo.setInsertPolicy(QComboBox.NoInsert)
         template_combo.addItem("Custom")
         template_combo.addItems(curve_templates.keys())
-        template_combo.setStyleSheet("color: white; background-color: #333; border-radius: 4px; padding: 2px;")
+        template_combo.setStyleSheet("color: palette(window-text); background-color: palette(base); border-radius: 4px; padding: 2px;")
         layout.addWidget(template_combo)
 
         light_label = QLabel("Auto intensity")
-        light_label.setStyleSheet("color: white;")
+        light_label.setStyleSheet("color: palette(window-text);")
         light_editor = CurveEditor(
             original_light_points,
             x_labels=("Sunrise", "Midday", "Sunset"),
@@ -693,7 +758,7 @@ class TrayControlSource:
             current_y=current_light_y,
         )
         color_label = QLabel("Color")
-        color_label.setStyleSheet("color: white;")
+        color_label.setStyleSheet("color: palette(window-text);")
         color_editor = CurveEditor(
             original_color_points,
             x_labels=("Sunrise", "Midday", "Sunset"),

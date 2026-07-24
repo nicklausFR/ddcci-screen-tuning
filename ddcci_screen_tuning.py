@@ -1,9 +1,12 @@
 import os
+import sys
+from pathlib import Path
 
 import yaml
 
 
 DEFAULT_CONFIG = {
+    "APP_THEME": "auto",
     "SLIDER_DEBOUNCE": 0.1,
     "DDCCI_COMMAND_DELAY": 0.15,
     "BRIGHTNESS_RANGE": [0, 100],
@@ -50,8 +53,6 @@ DEFAULT_CONFIG = {
     ],
     "AMBIENT_USB_BAUDRATE": 115200,
     "AMBIENT_USB_TIMEOUT": 1.0,
-    "AMBIENT_MIN_LUX": 5.0,
-    "AMBIENT_MAX_LUX": 500.0,
     "AMBIENT_SMOOTHING_ENABLED": True,
     "AMBIENT_SMOOTHING_MODE": "steps",
     "AMBIENT_SMOOTHING_STEPS": 4,
@@ -72,20 +73,34 @@ DEFAULT_CONFIG = {
     "TRAY_LIGHT": 50,
     "DETAIL_ROWS_VISIBLE": True,
     "SELECTED_MONITOR_INDEX": 0,
+    "RESET_DISPLAYS_ON_EXIT": False,
 }
 
 
 class Config:
     def __init__(self, path="config.yaml"):
-        self._path = path
+        self._path = self._resolve_path(path)
         data = dict(DEFAULT_CONFIG)
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
+        if os.path.exists(self._path):
+            with open(self._path, "r", encoding="utf-8") as f:
                 loaded = yaml.safe_load(f) or {}
             if isinstance(loaded, dict):
                 data.update(loaded)
         self._data = data
         self.__dict__.update(data)
+
+    @staticmethod
+    def _base_dir():
+        if getattr(sys, "frozen", False):
+            return Path(sys.executable).resolve().parent
+        return Path(__file__).resolve().parent
+
+    @classmethod
+    def _resolve_path(cls, path):
+        path = Path(path)
+        if path.is_absolute():
+            return path
+        return cls._base_dir() / path
 
     def set(self, name, value):
         self._data[name] = value
@@ -120,6 +135,7 @@ class Config:
                 lines[-1] += "\n"
             lines.append(line)
 
+        self._path.parent.mkdir(parents=True, exist_ok=True)
         with open(self._path, "w", encoding="utf-8") as f:
             f.writelines(lines)
 
