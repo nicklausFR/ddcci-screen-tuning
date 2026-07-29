@@ -983,6 +983,7 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
                     f"Ambient BLE source connected to "
                     f"{device.name or device.address} ({device.address})."
                 )
+                next_heartbeat = asyncio.get_running_loop().time() + 30.0
 
                 while (
                     self.running
@@ -990,6 +991,10 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
                     and not disconnected.is_set()
                 ):
                     await asyncio.sleep(0.25)
+                    now = asyncio.get_running_loop().time()
+                    if now >= next_heartbeat:
+                        await self._write_json_async({"cmd": "ping"})
+                        next_heartbeat = now + 30.0
             except Exception as exc:
                 detail = str(exc).strip() or type(exc).__name__
                 self.last_error = detail
@@ -1014,7 +1019,6 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
         from bleak import BleakClient, BleakScanner
 
         loop = asyncio.get_running_loop()
-        found = loop.create_future()
         disconnected = asyncio.Event()
         wanted_name = str(
             getattr(config, "AMBIENT_BLE_NAME", "LuxSensor") or "LuxSensor"
@@ -1023,15 +1027,14 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
             getattr(config, "AMBIENT_BLE_ADDRESS", "") or ""
         ).strip().lower()
 
-        def on_advertisement(device, advertisement_data):
+        def matches_device(device, advertisement_data):
             advertised_name = advertisement_data.local_name or device.name or ""
             name_matches = advertised_name == wanted_name
             address_matches = (
                 bool(wanted_address)
                 and str(device.address).strip().lower() == wanted_address
             )
-            if (name_matches or address_matches) and not found.done():
-                found.set_result(device)
+            return name_matches or address_matches
 
         def on_disconnect(_client):
             loop.call_soon_threadsafe(disconnected.set)
@@ -1039,17 +1042,17 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
         timeout = self._config_float(
             "AMBIENT_BLE_SCAN_TIMEOUT", 20.0, 2.0, 120.0
         )
-        scanner = BleakScanner(on_advertisement)
         client = None
-        await scanner.start()
         try:
-            try:
-                device = await asyncio.wait_for(found, timeout=timeout)
-            except TimeoutError as exc:
+            device = await BleakScanner.find_device_by_filter(
+                matches_device,
+                timeout=timeout,
+            )
+            if device is None:
                 raise RuntimeError(
                     f"{wanted_name!r} introuvable après {timeout:g} s; "
                     "il est peut-être déjà connecté à une autre instance."
-                ) from exc
+                )
             client = BleakClient(
                 device,
                 disconnected_callback=on_disconnect,
@@ -1071,8 +1074,6 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
             if client is not None and client.is_connected:
                 await client.disconnect()
             raise
-        finally:
-            await scanner.stop()
 
     def _on_notification(self, _sender, data):
         if (
