@@ -769,6 +769,7 @@ class UsbSerialAmbientReader:
 class BleNusAmbientReader(UsbSerialAmbientReader):
     """Ambient sensor transport over Nordic UART Service."""
 
+    NUS_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
     NUS_RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
     NUS_TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
     MEASUREMENT_PACKET = struct.Struct("<2sBBfHHHB")
@@ -780,6 +781,8 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
         self.event_loop = None
         self._ble_task = None
         self._ble_write_lock = None
+        self._config_response_event = None
+        self._measurement_event = None
         self._rx_buffer = bytearray()
         self._logged_first_measurement = False
 
@@ -901,7 +904,7 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
         except Exception:
             return False
 
-    async def _write_json_async(self, payload):
+    async def _write_json_async(self, payload, response=False):
         write_lock = self._ble_write_lock
         if write_lock is None:
             return False
@@ -913,15 +916,19 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
             characteristic = client.services.get_characteristic(
                 self.NUS_RX_UUID
             )
-            chunk_size = max(
-                20,
-                characteristic.max_write_without_response_size,
+            chunk_size = (
+                20
+                if response
+                else max(
+                    20,
+                    characteristic.max_write_without_response_size,
+                )
             )
             for offset in range(0, len(line), chunk_size):
                 await client.write_gatt_char(
                     self.NUS_RX_UUID,
                     line[offset : offset + chunk_size],
-                    response=False,
+                    response=response,
                 )
                 if offset + chunk_size < len(line):
                     await asyncio.sleep(0.1)
@@ -950,6 +957,42 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
             ),
         }
 
+    async def _wait_for_config_confirmation(
+        self,
+        previous_config_at,
+        expected,
+        timeout=15.0,
+    ):
+        event = self._config_response_event
+        if event is None:
+            raise RuntimeError("BLE config response event is unavailable")
+        deadline = asyncio.get_running_loop().time() + timeout
+        while True:
+            config_is_new = (
+                (self._last_config_at or 0.0) > previous_config_at
+            )
+            config_matches = (
+                config_is_new
+                and self._last_config_cmd == "config.set"
+                and all(
+                    self._last_config.get(name) == value
+                    for name, value in expected.items()
+                )
+            )
+            if config_matches:
+                return
+            if self._last_config_error:
+                raise RuntimeError(
+                    f"sensor config rejected: {self._last_config_error}"
+                )
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise TimeoutError(
+                    "sensor config confirmation timed out"
+                )
+            event.clear()
+            await asyncio.wait_for(event.wait(), timeout=remaining)
+
     def _thread_main(self):
         try:
             asyncio.run(self._run_ble())
@@ -962,6 +1005,8 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
             self.event_loop = None
             self._ble_task = None
             self._ble_write_lock = None
+            self._config_response_event = None
+            self._measurement_event = None
             self.client = None
             self.available = False
             if self.running:
@@ -979,6 +1024,8 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
         self.event_loop = asyncio.get_running_loop()
         self._ble_task = asyncio.current_task()
         self._ble_write_lock = asyncio.Lock()
+        self._config_response_event = asyncio.Event()
+        self._measurement_event = asyncio.Event()
         reconnect_seconds = self._config_float(
             "AMBIENT_BLE_RECONNECT_SECONDS", 3.0, 0.5, 60.0
         )
@@ -989,8 +1036,26 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
                 await client.start_notify(self.NUS_TX_UUID, self._on_notification)
                 self.last_error = None
                 self.port_name = device.address
+                saved_config = self._saved_config_values()
+                expected_config = {
+                    name: value
+                    for name, value in saved_config.items()
+                    if name != "cmd"
+                }
+                previous_config_at = self._last_config_at or 0.0
+                self._last_config_error = None
+                self._config_response_event.clear()
+                await self._write_json_async(saved_config)
+                await self._wait_for_config_confirmation(
+                    previous_config_at,
+                    expected_config,
+                )
+                self._measurement_event.clear()
                 await self._write_json_async({"cmd": "get"})
-                await self._write_json_async(self._saved_config_values())
+                await asyncio.wait_for(
+                    self._measurement_event.wait(),
+                    timeout=10.0,
+                )
                 self.available = True
                 self._log(
                     f"Ambient BLE source connected to "
@@ -1006,7 +1071,10 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
                     await asyncio.sleep(0.25)
                     now = asyncio.get_running_loop().time()
                     if now >= next_heartbeat:
-                        await self._write_json_async({"cmd": "ping"})
+                        await self._write_json_async(
+                            {"cmd": "ping"},
+                            response=True,
+                        )
                         next_heartbeat = now + 30.0
             except Exception as exc:
                 detail = str(exc).strip() or type(exc).__name__
@@ -1050,6 +1118,9 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
             return name_matches or address_matches
 
         def on_disconnect(_client):
+            self._log(
+                "[WARN] Ambient BLE link disconnected by Windows or peripheral."
+            )
             loop.call_soon_threadsafe(disconnected.set)
 
         timeout = self._config_float(
@@ -1070,9 +1141,10 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
                 device,
                 disconnected_callback=on_disconnect,
                 timeout=30.0,
+                services={self.NUS_SERVICE_UUID},
                 winrt={
                     "address_type": "random",
-                    "use_cached_services": True,
+                    "use_cached_services": False,
                 },
             )
             try:
@@ -1128,6 +1200,8 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
                     else gain_index
                 ),
             )
+            if self._measurement_event is not None:
+                self._measurement_event.set()
             return
 
         self._rx_buffer.extend(data)
@@ -1138,9 +1212,22 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
             if not line:
                 continue
             try:
+                previous_config_at = self._last_config_at
+                previous_config_error = self._last_config_error
                 payload = self._parse_line(line)
+                if (
+                    self._config_response_event is not None
+                    and (
+                        self._last_config_at != previous_config_at
+                        or self._last_config_error
+                        != previous_config_error
+                    )
+                ):
+                    self._config_response_event.set()
                 if payload is not None:
                     self.controller.on_measurement(**payload)
+                    if self._measurement_event is not None:
+                        self._measurement_event.set()
             except Exception as exc:
                 self._log(f"[WARN] Ambient BLE line ignored: {exc}")
 
@@ -1148,6 +1235,7 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
 class AmbientSensorControlSource:
     def __init__(self):
         self.controller = AmbientLightController()
+        self._reconnect_lock = threading.Lock()
         transport = str(
             getattr(config, "AMBIENT_SENSOR_TRANSPORT", "ble") or "ble"
         ).strip().lower()
@@ -1208,6 +1296,21 @@ class AmbientSensorControlSource:
                 return False
         return self.reader.reset_config()
 
+    def force_reconnect(self):
+        if not self._reconnect_lock.acquire(blocking=False):
+            return False
+
+        def reconnect():
+            try:
+                self.reader.stop()
+                time.sleep(0.5)
+                self.reader.start()
+            finally:
+                self._reconnect_lock.release()
+
+        threading.Thread(target=reconnect, daemon=True).start()
+        return True
+
     def is_running(self):
         return self.reader.running
 
@@ -1215,17 +1318,13 @@ class AmbientSensorControlSource:
         return self.controller.recalculate_current()
 
     def is_available(self):
-        if self.reader.running or self.reader.available:
-            return True
-        if self.reader.last_error:
-            return False
-        return self.reader.is_port_available()
+        return bool(self.reader.available)
 
     def status(self):
         data = self.controller.status()
         data["running"] = self.reader.running
         data["port"] = self.reader.port_name
-        data["available"] = self.reader.available or self.reader.running
+        data["available"] = self.reader.available
         data["error"] = self.reader.last_error
         data["sensor_config"] = self.reader._last_config
         data["sensor_config_age"] = None if self.reader._last_config_at is None else time.monotonic() - self.reader._last_config_at
