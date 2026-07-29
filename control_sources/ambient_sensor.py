@@ -1,6 +1,8 @@
+import asyncio
 import json
 import math
 import re
+import struct
 import threading
 import time
 
@@ -756,10 +758,334 @@ class UsbSerialAmbientReader:
         return value if value in ("auto", "interval") else default
 
 
+class BleNusAmbientReader(UsbSerialAmbientReader):
+    """JSON-line ambient sensor transport over Nordic UART Service."""
+
+    NUS_RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
+    NUS_TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
+    MEASUREMENT_PACKET = struct.Struct("<2sBBfHHHB")
+    GAIN_NAMES = ("low", "med", "high", "max")
+
+    def __init__(self, controller):
+        super().__init__(controller)
+        self.client = None
+        self.event_loop = None
+        self._ble_write_lock = None
+        self._rx_buffer = bytearray()
+
+    def start(self):
+        if self.running:
+            return True
+        try:
+            import bleak  # noqa: F401
+        except ImportError:
+            self.last_error = "bleak is not installed"
+            print("[WARN] Ambient BLE source requires bleak.")
+            return False
+
+        self.running = True
+        self.available = False
+        self.last_error = None
+        self._rx_buffer.clear()
+        self.port_name = str(
+            getattr(config, "AMBIENT_BLE_NAME", "LuxSensor") or "LuxSensor"
+        ).strip()
+        self.thread = threading.Thread(target=self._thread_main, daemon=True)
+        self.thread.start()
+        print(f"Ambient BLE source is looking for {self.port_name!r}.")
+        return True
+
+    def is_port_available(self):
+        try:
+            import bleak  # noqa: F401
+        except ImportError:
+            return False
+        return True
+
+    def stop(self):
+        self.running = False
+        loop = self.event_loop
+        client = self.client
+        if loop is not None and client is not None and client.is_connected:
+            try:
+                asyncio.run_coroutine_threadsafe(client.disconnect(), loop)
+            except Exception:
+                pass
+        thread = self.thread
+        if (
+            thread is not None
+            and thread is not threading.current_thread()
+            and thread.is_alive()
+        ):
+            thread.join(timeout=3.0)
+        self.thread = None
+        self.client = None
+        self.available = False
+        self.port_name = None
+        self.controller.close()
+
+    def request_measurement(self, force=False):
+        if not self.available:
+            return False
+        now = time.monotonic()
+        if not force and now - self._last_request_at < 1.0:
+            return False
+        if self._write_json({"cmd": "get"}):
+            self._last_request_at = now
+            return True
+        return False
+
+    def _write_json(self, payload):
+        loop = self.event_loop
+        client = self.client
+        if (
+            loop is None
+            or client is None
+            or not client.is_connected
+            or not self.running
+        ):
+            return False
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._write_json_async(payload), loop
+            )
+            return True
+        except Exception:
+            return False
+
+    async def _write_json_async(self, payload):
+        write_lock = self._ble_write_lock
+        if write_lock is None:
+            return False
+        line = json.dumps(payload, separators=(",", ":")).encode("utf-8") + b"\n"
+        async with write_lock:
+            client = self.client
+            if client is None or not client.is_connected:
+                return False
+            # Twenty-byte acknowledged writes fit the default ATT MTU and
+            # prevent a long JSON command from overflowing the RX FIFO.
+            for offset in range(0, len(line), 20):
+                await client.write_gatt_char(
+                    self.NUS_RX_UUID,
+                    line[offset : offset + 20],
+                    response=True,
+                )
+        return True
+
+    def _saved_config_values(self):
+        return {
+            "cmd": "config.set",
+            "refreshMs": self._config_int(
+                "AMBIENT_SENSOR_REFRESH_MS", 100, 50, 60000
+            ),
+            "publishLuxChangePercent": self._config_float(
+                "AMBIENT_SENSOR_PUBLISH_LUX_CHANGE_PERCENT",
+                1.0,
+                0.0,
+                100.0,
+            ),
+            "publishMaxIntervalSeconds": self._config_int(
+                "AMBIENT_SENSOR_PUBLISH_MAX_INTERVAL_SECONDS",
+                30,
+                1,
+                86400,
+            ),
+            "publishMode": self._config_publish_mode(
+                "AMBIENT_SENSOR_PUBLISH_MODE", "auto"
+            ),
+        }
+
+    def _thread_main(self):
+        try:
+            asyncio.run(self._run_ble())
+        except Exception as exc:
+            self.last_error = str(exc)
+            print("[WARN] Ambient BLE worker stopped:", exc)
+        finally:
+            self.event_loop = None
+            self._ble_write_lock = None
+            self.client = None
+            self.available = False
+            if self.running:
+                self.running = False
+                if self.on_unavailable is not None:
+                    try:
+                        self.on_unavailable(RuntimeError(self.last_error or "BLE stopped"))
+                    except Exception as callback_exc:
+                        print("[WARN] Ambient BLE unavailable callback failed:", callback_exc)
+
+    async def _run_ble(self):
+        self.event_loop = asyncio.get_running_loop()
+        self._ble_write_lock = asyncio.Lock()
+        reconnect_seconds = self._config_float(
+            "AMBIENT_BLE_RECONNECT_SECONDS", 3.0, 0.5, 60.0
+        )
+        while self.running:
+            try:
+                client, device, disconnected = await self._connect_once()
+                self.client = client
+                await client.start_notify(self.NUS_TX_UUID, self._on_notification)
+                self.last_error = None
+                self.port_name = device.address
+                await self._write_json_async({"cmd": "get"})
+                await self._write_json_async(self._saved_config_values())
+                self.available = True
+                print(
+                    f"Ambient BLE source connected to "
+                    f"{device.name or device.address} ({device.address})."
+                )
+
+                while (
+                    self.running
+                    and client.is_connected
+                    and not disconnected.is_set()
+                ):
+                    await asyncio.sleep(0.25)
+            except Exception as exc:
+                detail = str(exc).strip() or type(exc).__name__
+                self.last_error = detail
+                print(
+                    f"[WARN] Ambient BLE connection failed "
+                    f"({type(exc).__name__}): {detail}"
+                )
+            finally:
+                self.available = False
+                client = self.client
+                self.client = None
+                if client is not None and client.is_connected:
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+
+            if self.running:
+                await asyncio.sleep(reconnect_seconds)
+
+    async def _connect_once(self):
+        from bleak import BleakClient, BleakScanner
+
+        loop = asyncio.get_running_loop()
+        found = loop.create_future()
+        disconnected = asyncio.Event()
+        wanted_name = str(
+            getattr(config, "AMBIENT_BLE_NAME", "LuxSensor") or "LuxSensor"
+        ).strip()
+        wanted_address = str(
+            getattr(config, "AMBIENT_BLE_ADDRESS", "") or ""
+        ).strip().lower()
+
+        def on_advertisement(device, advertisement_data):
+            advertised_name = advertisement_data.local_name or device.name or ""
+            name_matches = advertised_name == wanted_name
+            address_matches = (
+                bool(wanted_address)
+                and str(device.address).strip().lower() == wanted_address
+            )
+            if (name_matches or address_matches) and not found.done():
+                found.set_result(device)
+
+        def on_disconnect(_client):
+            loop.call_soon_threadsafe(disconnected.set)
+
+        timeout = self._config_float(
+            "AMBIENT_BLE_SCAN_TIMEOUT", 20.0, 2.0, 120.0
+        )
+        scanner = BleakScanner(on_advertisement)
+        client = None
+        await scanner.start()
+        try:
+            try:
+                device = await asyncio.wait_for(found, timeout=timeout)
+            except TimeoutError as exc:
+                raise RuntimeError(
+                    f"{wanted_name!r} introuvable après {timeout:g} s; "
+                    "il est peut-être déjà connecté à une autre instance."
+                ) from exc
+            client = BleakClient(
+                device,
+                disconnected_callback=on_disconnect,
+                timeout=30.0,
+                winrt={
+                    "address_type": "random",
+                    "use_cached_services": False,
+                },
+            )
+            try:
+                await client.connect()
+            except TimeoutError as exc:
+                raise RuntimeError(
+                    f"délai dépassé pendant la connexion Windows à "
+                    f"{wanted_name!r}"
+                ) from exc
+            return client, device, disconnected
+        except BaseException:
+            if client is not None and client.is_connected:
+                await client.disconnect()
+            raise
+        finally:
+            await scanner.stop()
+
+    def _on_notification(self, _sender, data):
+        if (
+            len(data) == self.MEASUREMENT_PACKET.size
+            and data[:2] == b"LT"
+        ):
+            (
+                _magic,
+                version,
+                quality,
+                lux,
+                visible,
+                infrared,
+                full,
+                gain_index,
+            ) = self.MEASUREMENT_PACKET.unpack(data)
+            if version != 1:
+                print(
+                    f"[WARN] Ambient BLE measurement version "
+                    f"{version} is unsupported."
+                )
+                return
+            self.controller.on_measurement(
+                lux=None if math.isnan(lux) else lux,
+                visible=visible,
+                ir=infrared,
+                full=full,
+                saturated=bool(quality & 1),
+                quality=quality,
+                range_id=(
+                    self.GAIN_NAMES[gain_index]
+                    if gain_index < len(self.GAIN_NAMES)
+                    else gain_index
+                ),
+            )
+            return
+
+        self._rx_buffer.extend(data)
+        while b"\n" in self._rx_buffer:
+            raw_line, _, remainder = self._rx_buffer.partition(b"\n")
+            self._rx_buffer = bytearray(remainder)
+            line = raw_line.rstrip(b"\r").decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            try:
+                payload = self._parse_line(line)
+                if payload is not None:
+                    self.controller.on_measurement(**payload)
+            except Exception as exc:
+                print("[WARN] Ambient BLE line ignored:", exc)
+
+
 class AmbientSensorControlSource:
     def __init__(self):
         self.controller = AmbientLightController()
-        self.reader = UsbSerialAmbientReader(self.controller)
+        transport = str(
+            getattr(config, "AMBIENT_SENSOR_TRANSPORT", "ble") or "ble"
+        ).strip().lower()
+        if transport == "usb":
+            self.reader = UsbSerialAmbientReader(self.controller)
+        else:
+            self.reader = BleNusAmbientReader(self.controller)
 
     def set_unavailable_callback(self, callback):
         self.reader.on_unavailable = callback
