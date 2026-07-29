@@ -148,7 +148,7 @@ class AmbientLuxGraph(QWidget):
         self.samples = []
         self.window_seconds = 10.0
         self.lux_zero = 0.1
-        self.lux_full = 10000.0
+        self.lux_full = 20000.0
         self.current_lux = None
         self.current_filtered_lux = None
         self.current_saturated = False
@@ -228,7 +228,7 @@ class AmbientLuxGraph(QWidget):
                 values.append(filtered)
         min_positive = self._min_positive
         y_min = math.log10(0.1)
-        y_max = math.log10(10000.0)
+        y_max = math.log10(20000.0)
         self._plot_rect = rect
         self._y_min_log = y_min
         self._y_max_log = y_max
@@ -2388,6 +2388,9 @@ class PopupPanel(QWidget):
         sensor_interval_row = add_value_row("Max push interval s", sensor_interval_edit, advanced_layout)
         sensor_status_label = label("")
         advanced_layout.addWidget(sensor_status_label)
+        sensor_reconnect_button = QPushButton("Force reconnect")
+        sensor_reconnect_button.setStyleSheet(field_style)
+        advanced_layout.addWidget(sensor_reconnect_button)
         advanced_layout.addStretch()
         sensor_config_last = {
             "values": {
@@ -2400,7 +2403,7 @@ class PopupPanel(QWidget):
         sensor_config_pending = {"values": None, "sent_at": None}
 
         min_lux = 0.1
-        max_lux = 10000.0
+        max_lux = 20000.0
         scale_note = label("Logarithmic lux scale: each interval = 10x")
         scale_note.setStyleSheet("color: palette(mid);")
         layout.addWidget(scale_note)
@@ -2418,7 +2421,7 @@ class PopupPanel(QWidget):
             y_label="Screen light",
             y_tick_labels={0: "0%", 50: "50%", 100: "100%"},
             x_display_exponent=1.0,
-            x_tick_labels={0: "0.1 lx", 20: "1 lx", 40: "10 lx", 60: "100 lx", 80: "1000 lx", 100: "10000 lx"},
+            x_tick_labels={0: "0.1 lx", 19: "1 lx", 38: "10 lx", 57: "100 lx", 75: "1000 lx", 94: "10000 lx", 100: "20000 lx"},
         )
         curve_editor.setMinimumHeight(175)
         layout.addWidget(curve_label)
@@ -2440,11 +2443,12 @@ class PopupPanel(QWidget):
         def update_curve_lux_labels(min_lux, max_lux):
             curve_editor.x_tick_labels = {
                 0: "0.1 lx",
-                20: "1 lx",
-                40: "10 lx",
-                60: "100 lx",
-                80: "1000 lx",
-                100: "10000 lx",
+                19: "1 lx",
+                38: "10 lx",
+                57: "100 lx",
+                75: "1000 lx",
+                94: "10000 lx",
+                100: "20000 lx",
             }
             curve_editor.update()
 
@@ -2533,6 +2537,21 @@ class PopupPanel(QWidget):
             sensor_status_label.setText("waiting for sensor confirmation")
             return values
 
+        def force_sensor_reconnect():
+            sensor_config_pending["values"] = None
+            sensor_config_pending["sent_at"] = None
+            sensor_status_label.setText("forcing sensor reconnection")
+            sensor_reconnect_button.setEnabled(False)
+            if (
+                self.ambient_source is None
+                or not self.ambient_source.force_reconnect()
+            ):
+                sensor_status_label.setText("reconnection already in progress")
+            QTimer.singleShot(
+                3000,
+                lambda: sensor_reconnect_button.setEnabled(True),
+            )
+
         def save_settings():
             self.config.set("AMBIENT_LIGHT_CURVE_POINTS", list(curve_editor.points))
             update_curve_lux_labels(min_lux, max_lux)
@@ -2590,6 +2609,8 @@ class PopupPanel(QWidget):
                 set_sensor_config_fields(sensor_config_last["values"])
                 sensor_status_label.setText("sensor config timeout; reconnecting")
             elif (
+                status.get("available")
+                and
                 isinstance(runtime_config, dict)
                 and response_is_current
                 and response_matches_pending
@@ -2626,6 +2647,10 @@ class PopupPanel(QWidget):
                 set_sensor_config_enabled(True)
                 set_sensor_config_fields(sensor_config_last["values"])
                 sensor_status_label.setText(str(status.get("sensor_config_error")))
+            elif not status.get("available"):
+                sensor_status_label.setText(
+                    status.get("error") or "connecting to sensor"
+                )
             current_x = normalized_lux(status.get("filtered_lux") or status.get("lux"), min_lux, max_lux)
             curve_editor.current_x = current_x
             if current_x is not None:
@@ -2644,6 +2669,7 @@ class PopupPanel(QWidget):
             save_sensor_config()
 
         sensor_mode_combo.currentIndexChanged.connect(sensor_mode_changed)
+        sensor_reconnect_button.clicked.connect(force_sensor_reconnect)
         update_sensor_config_visibility()
 
         status_timer = QTimer(parent)
@@ -2997,7 +3023,7 @@ class PopupPanel(QWidget):
         nightlight_color_tabs.addTab(nightlight_curve_tab, "Light-color link")
         nightlight_color_layout.addWidget(nightlight_color_tabs)
 
-        show_ambient = self.ambient_source is not None and "ambient" in self.available_sources
+        show_ambient = self.ambient_source is not None
         ambient_tab = None
         if show_ambient:
             ambient_tab = QWidget()
@@ -3158,8 +3184,7 @@ class PopupPanel(QWidget):
                         break
 
         def update_display_source_available(source, available):
-            if source == "ambient" and not available:
-                remove_page("ambient")
+            pass
 
         self._display_settings_set_source_available = update_display_source_available
 

@@ -58,7 +58,10 @@ class TrayControlSource:
         ambient_enabled = bool(getattr(config, "AMBIENT_SOURCE_ENABLED", False))
         startup_ambient_available = self.ambient_source is not None and self.ambient_source.is_available()
         self._ambient_seen_at_start = startup_ambient_available
-        self._ambient_watch_enabled = startup_ambient_available
+        self._ambient_watch_enabled = (
+            self.ambient_source is not None
+            and (ambient_enabled or startup_ambient_available)
+        )
         self.tray_icon = create_tray_icon(
             self.show_active_source_window,
             self.open_configuration,
@@ -69,7 +72,7 @@ class TrayControlSource:
             self.select_nightlight_backend,
             self._nightlight_backend(),
         )
-        if ambient_enabled and startup_ambient_available and self.ambient_source is not None:
+        if ambient_enabled and self.ambient_source is not None:
             self.set_daytime_enabled(False)
             if not self.ambient_source.start():
                 self._sync_tray_source_menu("tray")
