@@ -129,6 +129,18 @@ if hasattr(app, "commitDataRequest"):
 
 
 ambient_source = AmbientSensorControlSource()
+
+
+def stop_ambient_source():
+    try:
+        ambient_source.stop()
+    except Exception as exc:
+        print("[WARN] Ambient BLE shutdown failed:", exc)
+
+
+app.aboutToQuit.connect(stop_ambient_source)
+atexit.register(stop_ambient_source)
+
 tray_source = TrayControlSource(ambient_source=ambient_source)
 tray_icon = tray_source.start()
 sys.exit(app.exec())

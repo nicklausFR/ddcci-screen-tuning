@@ -3,8 +3,10 @@ import json
 import math
 import re
 import struct
+import sys
 import threading
 import time
+from pathlib import Path
 
 from ddcci_command_queue import submit_ddcci_command, submit_light_values
 from ddcci_screen_tuning import config
@@ -759,7 +761,7 @@ class UsbSerialAmbientReader:
 
 
 class BleNusAmbientReader(UsbSerialAmbientReader):
-    """JSON-line ambient sensor transport over Nordic UART Service."""
+    """Ambient sensor transport over Nordic UART Service."""
 
     NUS_RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
     NUS_TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
@@ -770,46 +772,80 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
         super().__init__(controller)
         self.client = None
         self.event_loop = None
+        self._ble_task = None
         self._ble_write_lock = None
         self._rx_buffer = bytearray()
+        self._logged_first_measurement = False
+
+    def _log(self, message):
+        print(message)
+        if not getattr(sys, "frozen", False):
+            return
+        try:
+            log_path = Path(sys.executable).resolve().parent / "ambient_ble.log"
+            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            with log_path.open("a", encoding="utf-8") as log_file:
+                log_file.write(f"{timestamp} {message}\n")
+        except Exception:
+            pass
 
     def start(self):
         if self.running:
             return True
         try:
             import bleak  # noqa: F401
-        except ImportError:
-            self.last_error = "bleak is not installed"
-            print("[WARN] Ambient BLE source requires bleak.")
+        except ImportError as exc:
+            self.last_error = f"bleak import failed: {exc}"
+            self._log(f"[WARN] Ambient BLE source requires bleak: {exc}")
             return False
 
         self.running = True
         self.available = False
         self.last_error = None
         self._rx_buffer.clear()
+        self._logged_first_measurement = False
         self.port_name = str(
             getattr(config, "AMBIENT_BLE_NAME", "LuxSensor") or "LuxSensor"
         ).strip()
         self.thread = threading.Thread(target=self._thread_main, daemon=True)
         self.thread.start()
-        print(f"Ambient BLE source is looking for {self.port_name!r}.")
+        self._log(f"Ambient BLE source is looking for {self.port_name!r}.")
         return True
 
     def is_port_available(self):
         try:
             import bleak  # noqa: F401
-        except ImportError:
+        except ImportError as exc:
+            self.last_error = f"bleak import failed: {exc}"
+            self._log(f"[WARN] Ambient BLE availability check failed: {exc}")
             return False
         return True
 
     def stop(self):
+        was_active = self.running or self.available or self.client is not None
+        if was_active:
+            self._log("Ambient BLE source is stopping.")
         self.running = False
         loop = self.event_loop
         client = self.client
+        ble_task = self._ble_task
         if loop is not None and client is not None and client.is_connected:
             try:
-                asyncio.run_coroutine_threadsafe(client.disconnect(), loop)
-            except Exception:
+                disconnect = asyncio.run_coroutine_threadsafe(
+                    client.disconnect(), loop
+                )
+                disconnect.result(timeout=5.0)
+            except Exception as exc:
+                self._log(
+                    f"[WARN] Ambient BLE graceful disconnect failed: {exc}"
+                )
+        # A client is only published after BleakClient.connect() completes.
+        # Cancelling the owning task is therefore essential when shutdown
+        # happens during scanning, GATT connection, or service discovery.
+        if loop is not None and ble_task is not None and not ble_task.done():
+            try:
+                loop.call_soon_threadsafe(ble_task.cancel)
+            except RuntimeError:
                 pass
         thread = self.thread
         if (
@@ -817,12 +853,18 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
             and thread is not threading.current_thread()
             and thread.is_alive()
         ):
-            thread.join(timeout=3.0)
+            thread.join(timeout=8.0)
+            if thread.is_alive():
+                self._log(
+                    "[WARN] Ambient BLE worker did not stop before shutdown."
+                )
         self.thread = None
         self.client = None
         self.available = False
         self.port_name = None
         self.controller.close()
+        if was_active:
+            self._log("Ambient BLE source stopped.")
 
     def request_measurement(self, force=False):
         if not self.available:
@@ -898,11 +940,14 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
     def _thread_main(self):
         try:
             asyncio.run(self._run_ble())
+        except asyncio.CancelledError:
+            pass
         except Exception as exc:
             self.last_error = str(exc)
-            print("[WARN] Ambient BLE worker stopped:", exc)
+            self._log(f"[WARN] Ambient BLE worker stopped: {exc}")
         finally:
             self.event_loop = None
+            self._ble_task = None
             self._ble_write_lock = None
             self.client = None
             self.available = False
@@ -912,10 +957,14 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
                     try:
                         self.on_unavailable(RuntimeError(self.last_error or "BLE stopped"))
                     except Exception as callback_exc:
-                        print("[WARN] Ambient BLE unavailable callback failed:", callback_exc)
+                        self._log(
+                            f"[WARN] Ambient BLE unavailable callback failed: "
+                            f"{callback_exc}"
+                        )
 
     async def _run_ble(self):
         self.event_loop = asyncio.get_running_loop()
+        self._ble_task = asyncio.current_task()
         self._ble_write_lock = asyncio.Lock()
         reconnect_seconds = self._config_float(
             "AMBIENT_BLE_RECONNECT_SECONDS", 3.0, 0.5, 60.0
@@ -930,7 +979,7 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
                 await self._write_json_async({"cmd": "get"})
                 await self._write_json_async(self._saved_config_values())
                 self.available = True
-                print(
+                self._log(
                     f"Ambient BLE source connected to "
                     f"{device.name or device.address} ({device.address})."
                 )
@@ -944,7 +993,7 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
             except Exception as exc:
                 detail = str(exc).strip() or type(exc).__name__
                 self.last_error = detail
-                print(
+                self._log(
                     f"[WARN] Ambient BLE connection failed "
                     f"({type(exc).__name__}): {detail}"
                 )
@@ -1041,11 +1090,17 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
                 gain_index,
             ) = self.MEASUREMENT_PACKET.unpack(data)
             if version != 1:
-                print(
+                self._log(
                     f"[WARN] Ambient BLE measurement version "
                     f"{version} is unsupported."
                 )
                 return
+            if not self._logged_first_measurement:
+                self._logged_first_measurement = True
+                self._log(
+                    f"Ambient BLE first measurement received: "
+                    f"lux={lux:.3f}, visible={visible}, quality=0x{quality:02x}."
+                )
             self.controller.on_measurement(
                 lux=None if math.isnan(lux) else lux,
                 visible=visible,
@@ -1073,7 +1128,7 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
                 if payload is not None:
                     self.controller.on_measurement(**payload)
             except Exception as exc:
-                print("[WARN] Ambient BLE line ignored:", exc)
+                self._log(f"[WARN] Ambient BLE line ignored: {exc}")
 
 
 class AmbientSensorControlSource:
