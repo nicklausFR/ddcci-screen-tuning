@@ -2397,7 +2397,7 @@ class PopupPanel(QWidget):
                 "publishMode": sensor_mode if sensor_mode in ("auto", "interval") else "auto",
             }
         }
-        sensor_config_pending = {"values": None}
+        sensor_config_pending = {"values": None, "sent_at": None}
 
         min_lux = 0.1
         max_lux = 10000.0
@@ -2489,6 +2489,12 @@ class PopupPanel(QWidget):
             update_sensor_config_visibility()
             sensor_config_updating["active"] = False
 
+        def set_sensor_config_enabled(enabled):
+            sensor_refresh_edit.setEnabled(enabled)
+            sensor_change_edit.setEnabled(enabled)
+            sensor_interval_edit.setEnabled(enabled)
+            sensor_mode_combo.setEnabled(enabled)
+
         def remember_sensor_config(values, save_file=True):
             sensor_config_last["values"] = dict(values)
             if save_file:
@@ -2500,14 +2506,31 @@ class PopupPanel(QWidget):
         def save_sensor_config():
             if sensor_config_updating["active"]:
                 return sensor_config_values()
+            if sensor_config_pending["values"] is not None:
+                sensor_status_label.setText("waiting for sensor confirmation")
+                return sensor_config_pending["values"]
             values = sensor_config_values()
-            if self.ambient_source is None or not self.ambient_source.apply_sensor_config(values):
+            changes = {
+                name: value
+                for name, value in values.items()
+                if value != sensor_config_last["values"].get(name)
+            }
+            if not changes:
+                set_sensor_config_fields(sensor_config_last["values"])
+                sensor_status_label.setText("sensor config unchanged")
+                return values
+            sensor_config_pending["values"] = dict(values)
+            sensor_config_pending["sent_at"] = time.monotonic()
+            set_sensor_config_enabled(False)
+            if self.ambient_source is None or not self.ambient_source.apply_sensor_config(changes):
+                sensor_config_pending["values"] = None
+                sensor_config_pending["sent_at"] = None
+                set_sensor_config_enabled(True)
                 set_sensor_config_fields(sensor_config_last["values"])
                 sensor_status_label.setText("not connected")
                 return sensor_config_last["values"]
-            sensor_config_pending["values"] = dict(values)
             set_sensor_config_fields(values)
-            sensor_status_label.setText("sent")
+            sensor_status_label.setText("waiting for sensor confirmation")
             return values
 
         def save_settings():
@@ -2536,7 +2559,26 @@ class PopupPanel(QWidget):
                 return
             status = self.ambient_source.status()
             runtime_config = status.get("sensor_config")
-            if isinstance(runtime_config, dict):
+            pending_sent_at = sensor_config_pending["sent_at"]
+            config_received_at = status.get("sensor_config_received_at")
+            pending_timed_out = (
+                pending_sent_at is not None
+                and time.monotonic() - pending_sent_at > 20.0
+            )
+            response_is_current = (
+                pending_sent_at is None
+                or (
+                    config_received_at is not None
+                    and config_received_at > pending_sent_at
+                )
+            )
+            if pending_timed_out:
+                sensor_config_pending["values"] = None
+                sensor_config_pending["sent_at"] = None
+                set_sensor_config_enabled(True)
+                set_sensor_config_fields(sensor_config_last["values"])
+                sensor_status_label.setText("sensor config timeout; reconnecting")
+            elif isinstance(runtime_config, dict) and response_is_current:
                 runtime_values = {
                     "refreshMs": int(runtime_config.get("refreshMs", sensor_config_last["values"]["refreshMs"])),
                     "publishLuxChangePercent": float(runtime_config.get("publishLuxChangePercent", sensor_config_last["values"]["publishLuxChangePercent"])),
@@ -2546,6 +2588,8 @@ class PopupPanel(QWidget):
                 save_runtime = sensor_config_pending["values"] is not None
                 remember_sensor_config(runtime_values, save_file=save_runtime)
                 sensor_config_pending["values"] = None
+                sensor_config_pending["sent_at"] = None
+                set_sensor_config_enabled(True)
                 sensor_config_updating["active"] = True
                 if not sensor_refresh_edit.hasFocus() and "refreshMs" in runtime_config:
                     sensor_refresh_edit.setText(str(runtime_config["refreshMs"]))
@@ -2563,6 +2607,8 @@ class PopupPanel(QWidget):
                 sensor_status_label.setText("sensor config ok")
             elif status.get("sensor_config_error"):
                 sensor_config_pending["values"] = None
+                sensor_config_pending["sent_at"] = None
+                set_sensor_config_enabled(True)
                 set_sensor_config_fields(sensor_config_last["values"])
                 sensor_status_label.setText(str(status.get("sensor_config_error")))
             current_x = normalized_lux(status.get("filtered_lux") or status.get("lux"), min_lux, max_lux)

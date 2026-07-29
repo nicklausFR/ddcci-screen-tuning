@@ -1215,5 +1215,6 @@ class AmbientSensorControlSource:
         data["error"] = self.reader.last_error
         data["sensor_config"] = self.reader._last_config
         data["sensor_config_age"] = None if self.reader._last_config_at is None else time.monotonic() - self.reader._last_config_at
+        data["sensor_config_received_at"] = self.reader._last_config_at
         data["sensor_config_error"] = self.reader._last_config_error
         return data
