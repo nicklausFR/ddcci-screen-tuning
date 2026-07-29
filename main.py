@@ -10,13 +10,51 @@ from pathlib import Path
 from PySide6.QtCore import QLockFile
 from PySide6.QtWidgets import QApplication, QWidget
 
-from control_sources import AmbientSensorControlSource, TrayControlSource
+
+_instance_mutex_handle = None
+_instance_lock = None
 
 
-instance_lock = QLockFile(str(Path(tempfile.gettempdir()) / "ddcci-screen-tuning.lock"))
-if not instance_lock.tryLock(0):
+def acquire_single_instance():
+    global _instance_mutex_handle, _instance_lock
+
+    if sys.platform == "win32":
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.argtypes = (
+            ctypes.c_void_p,
+            ctypes.wintypes.BOOL,
+            ctypes.wintypes.LPCWSTR,
+        )
+        kernel32.CreateMutexW.restype = ctypes.wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = (ctypes.wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = ctypes.wintypes.BOOL
+
+        ctypes.set_last_error(0)
+        handle = kernel32.CreateMutexW(
+            None,
+            False,
+            "Local\\ddcci-screen-tuning-single-instance",
+        )
+        if not handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+            kernel32.CloseHandle(handle)
+            return False
+        _instance_mutex_handle = handle
+        return True
+
+    _instance_lock = QLockFile(
+        str(Path(tempfile.gettempdir()) / "ddcci-screen-tuning.lock")
+    )
+    return _instance_lock.tryLock(0)
+
+
+if not acquire_single_instance():
     print("[WARN] ddcci-screen-tuning is already running.")
     sys.exit(0)
+
+from control_sources import AmbientSensorControlSource, TrayControlSource
+
 
 app = QApplication(sys.argv)
 app.setQuitOnLastWindowClosed(False)
