@@ -2561,6 +2561,17 @@ class PopupPanel(QWidget):
             runtime_config = status.get("sensor_config")
             pending_sent_at = sensor_config_pending["sent_at"]
             config_received_at = status.get("sensor_config_received_at")
+            pending_values = sensor_config_pending["values"]
+            response_matches_pending = (
+                pending_values is None
+                or (
+                    isinstance(runtime_config, dict)
+                    and all(
+                        runtime_config.get(name) == expected
+                        for name, expected in pending_values.items()
+                    )
+                )
+            )
             pending_timed_out = (
                 pending_sent_at is not None
                 and time.monotonic() - pending_sent_at > 20.0
@@ -2578,7 +2589,11 @@ class PopupPanel(QWidget):
                 set_sensor_config_enabled(True)
                 set_sensor_config_fields(sensor_config_last["values"])
                 sensor_status_label.setText("sensor config timeout; reconnecting")
-            elif isinstance(runtime_config, dict) and response_is_current:
+            elif (
+                isinstance(runtime_config, dict)
+                and response_is_current
+                and response_matches_pending
+            ):
                 runtime_values = {
                     "refreshMs": int(runtime_config.get("refreshMs", sensor_config_last["values"]["refreshMs"])),
                     "publishLuxChangePercent": float(runtime_config.get("publishLuxChangePercent", sensor_config_last["values"]["publishLuxChangePercent"])),

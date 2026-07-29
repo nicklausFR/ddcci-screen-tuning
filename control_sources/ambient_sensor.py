@@ -99,6 +99,10 @@ class AmbientLightController:
             self._update_light_from_lux(lux)
             return True
 
+    def force_next_apply(self):
+        with self._lock:
+            self._last_applied_light = None
+
     def close(self):
         if self.monitor is not None:
             try:
@@ -330,6 +334,7 @@ class UsbSerialAmbientReader:
         self._last_request_at = 0.0
         self._last_config = None
         self._last_config_at = None
+        self._last_config_cmd = None
         self._last_config_error = None
         self._write_lock = threading.Lock()
 
@@ -601,6 +606,7 @@ class UsbSerialAmbientReader:
         if cmd in ("config.get", "config.set", "config.reset") and isinstance(data.get("config"), dict):
             self._last_config = dict(data["config"])
             self._last_config_at = time.monotonic()
+            self._last_config_cmd = cmd
             self._last_config_error = None
             self._sync_runtime_config(self._last_config)
         return True
@@ -904,14 +910,21 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
             client = self.client
             if client is None or not client.is_connected:
                 return False
-            # Twenty-byte acknowledged writes fit the default ATT MTU and
-            # prevent a long JSON command from overflowing the RX FIFO.
-            for offset in range(0, len(line), 20):
+            characteristic = client.services.get_characteristic(
+                self.NUS_RX_UUID
+            )
+            chunk_size = max(
+                20,
+                characteristic.max_write_without_response_size,
+            )
+            for offset in range(0, len(line), chunk_size):
                 await client.write_gatt_char(
                     self.NUS_RX_UUID,
-                    line[offset : offset + 20],
-                    response=True,
+                    line[offset : offset + chunk_size],
+                    response=False,
                 )
+                if offset + chunk_size < len(line):
+                    await asyncio.sleep(0.1)
         return True
 
     def _saved_config_values(self):
@@ -1059,7 +1072,7 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
                 timeout=30.0,
                 winrt={
                     "address_type": "random",
-                    "use_cached_services": False,
+                    "use_cached_services": True,
                 },
             )
             try:
@@ -1161,8 +1174,9 @@ class AmbientSensorControlSource:
         config.set("AMBIENT_SOURCE_ENABLED", enabled)
         self.controller.apply_enabled = enabled
         if enabled:
+            self.controller.force_next_apply()
             return self.reader.start()
-        self.stop()
+        self.controller.close()
         return True
 
     def stop(self):
