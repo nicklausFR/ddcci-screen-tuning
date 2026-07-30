@@ -1806,7 +1806,7 @@ class PopupPanel(QWidget):
             return True
         return False
 
-    def _build_light_curve_settings(self, parent, include_cancel=True):
+    def _build_light_curve_settings(self, parent, include_close=True):
         brightness_range = self._config_range("LIGHT_BRIGHTNESS_RANGE", (0, 100))
         contrast_range = self._config_range("LIGHT_CONTRAST_RANGE", (35, 100))
         original_brightness_points = self._curve_points_to_slider_values(
@@ -1890,36 +1890,17 @@ class PopupPanel(QWidget):
 
         button_row = QHBoxLayout()
         reset_button = QPushButton("Reset")
-        cancel_button = QPushButton("Cancel")
-        apply_button = QPushButton("Apply")
+        close_button = QPushButton("Close")
+        saved_label = QLabel("Saved")
+        saved_label.setStyleSheet("color: palette(mid);")
         button_row.addWidget(reset_button)
+        button_row.addWidget(saved_label)
         button_row.addStretch()
-        if include_cancel:
-            button_row.addWidget(cancel_button)
-        button_row.addWidget(apply_button)
+        if include_close:
+            button_row.addWidget(close_button)
         layout.addLayout(button_row)
 
-        def reset_points():
-            default_brightness = self._default_light_curve_points()
-            default_contrast = [
-                round(100 * math.sqrt(point / 100.0))
-                for point in default_brightness
-            ]
-            brightness_editor.points = self._curve_points_to_slider_values(default_brightness, brightness_range)
-            contrast_editor.points = self._curve_points_to_slider_values(default_contrast, contrast_range)
-            brightness_editor.update()
-            contrast_editor.update()
-
-        def apply_template(name):
-            template = curve_templates.get(name)
-            if template is None:
-                return
-            brightness_editor.points = self._curve_points_to_slider_values(template["brightness"], brightness_range)
-            contrast_editor.points = self._curve_points_to_slider_values(template["contrast"], contrast_range)
-            brightness_editor.update()
-            contrast_editor.update()
-
-        def apply_points():
+        def save_points():
             brightness_points = self._slider_values_to_curve_points(brightness_editor.points, brightness_range)
             contrast_points = self._slider_values_to_curve_points(contrast_editor.points, contrast_range)
             self.config.set("LIGHT_BRIGHTNESS_CURVE_POINTS", brightness_points)
@@ -1931,32 +1912,57 @@ class PopupPanel(QWidget):
             self._set_slider_silent("contrast", contrast)
             self._safe_set_light_values(brightness, contrast)
             self._remember_slider_values()
+            saved_label.setText("Saved")
+
+        def reset_points():
+            default_brightness = self._default_light_curve_points()
+            default_contrast = [
+                round(100 * math.sqrt(point / 100.0))
+                for point in default_brightness
+            ]
+            brightness_editor.points = self._curve_points_to_slider_values(default_brightness, brightness_range)
+            contrast_editor.points = self._curve_points_to_slider_values(default_contrast, contrast_range)
+            brightness_editor.update()
+            contrast_editor.update()
+            template_combo.setCurrentIndex(0)
+            save_points()
+
+        def apply_template(name):
+            template = curve_templates.get(name)
+            if template is None:
+                return
+            brightness_editor.points = self._curve_points_to_slider_values(template["brightness"], brightness_range)
+            contrast_editor.points = self._curve_points_to_slider_values(template["contrast"], contrast_range)
+            brightness_editor.update()
+            contrast_editor.update()
+            save_points()
+
+        def curve_edited():
+            if template_combo.currentText() != "Custom":
+                template_combo.setCurrentIndex(0)
+            save_points()
+
+        def curve_editing():
+            if template_combo.currentText() != "Custom":
+                template_combo.setCurrentIndex(0)
+            saved_label.setText("Editing\u2026")
 
         template_combo.currentTextChanged.connect(apply_template)
         reset_button.clicked.connect(reset_points)
-        apply_button.clicked.connect(apply_points)
-        return cancel_button, apply_button
+        brightness_editor.points_changed.connect(lambda points: curve_editing())
+        contrast_editor.points_changed.connect(lambda points: curve_editing())
+        brightness_editor.point_edit_finished.connect(lambda points: curve_edited())
+        contrast_editor.point_edit_finished.connect(lambda points: curve_edited())
+        return {"close": close_button, "save": save_points}
 
     def choose_light_curve(self):
-        original_light = self.sliders["light"].value()
-        original_brightness = self.sliders["brightness"].value()
-        original_contrast = self.sliders["contrast"].value()
-
         dialog = QDialog(self)
         self._light_curve_dialog = dialog
         dialog.setWindowTitle("B/C auto curve")
         dialog.setFixedSize(310, 515)
-        cancel_button, apply_button = self._build_light_curve_settings(dialog, include_cancel=True)
-        cancel_button.clicked.connect(dialog.reject)
-        apply_button.clicked.connect(dialog.accept)
-
-        if dialog.exec() != QDialog.Accepted:
-            self._set_slider_silent("light", original_light)
-            self._set_slider_silent("brightness", original_brightness)
-            self._set_slider_silent("contrast", original_contrast)
-            self._light_curve_dialog = None
-            return
-
+        controls = self._build_light_curve_settings(dialog, include_close=True)
+        controls["close"].clicked.connect(dialog.accept)
+        dialog.exec()
         self._light_curve_dialog = None
 
     def _build_smoothing_settings(self, parent):
@@ -2022,6 +2028,9 @@ class PopupPanel(QWidget):
         steps_row = add_edit_row("Steps", steps_edit)
         seconds_edit = QLineEdit(str(self._ambient_config_float("AMBIENT_SMOOTHING_SECONDS", 2.0, 0.05, 120.0)))
         seconds_row = add_edit_row("Time (s)", seconds_edit)
+        saved_label = label("Saved")
+        saved_label.setStyleSheet("color: palette(mid);")
+        layout.addWidget(saved_label)
         layout.addStretch()
 
         updating = {"active": False}
@@ -2057,6 +2066,7 @@ class PopupPanel(QWidget):
             self.config.set("AMBIENT_SMOOTHING_MODE", mode)
             self.config.set("AMBIENT_SMOOTHING_STEPS", steps)
             self.config.set("AMBIENT_SMOOTHING_SECONDS", seconds)
+            saved_label.setText("Saved")
 
         enabled_combo.currentIndexChanged.connect(lambda index: (update_visibility(), save_settings()))
         mode_combo.currentIndexChanged.connect(lambda index: (update_visibility(), save_settings()))
@@ -2144,17 +2154,12 @@ class PopupPanel(QWidget):
         """)
         layout.addWidget(temperature_slider)
 
-        button_row = QHBoxLayout()
-        apply_button = QPushButton("Apply")
-        apply_button.setFixedHeight(28)
-        button_row.addStretch()
-        button_row.addWidget(apply_button)
-        layout.addLayout(button_row)
+        saved_label = QLabel("Saved")
+        saved_label.setStyleSheet("color: palette(mid);")
+        layout.addWidget(saved_label)
         layout.addStretch()
 
         original_strength = {"value": self.sliders["nightlight"].value()}
-        original_kelvin = self._gamma_warm_kelvin()
-        applied = {"value": False}
         preview_active = {"value": False}
 
         def update_label():
@@ -2195,30 +2200,40 @@ class PopupPanel(QWidget):
             else:
                 self._safe_set_nightlight_strength(original_strength["value"])
 
-        def apply_temperature():
-            applied["value"] = True
+        def save_temperature():
             self.config.set("GAMMA_RAMP_WARM_KELVIN", temperature_slider.value())
             strength = self.sliders["nightlight"].value()
             original_strength["value"] = strength
-            if self._nightlight_backend() == NIGHTLIGHT_BACKEND_GAMMA:
+            if preview_button.isChecked():
+                self._apply_gamma_nightlight_strength(100)
+            elif self._nightlight_backend() == NIGHTLIGHT_BACKEND_GAMMA:
                 self._safe_set_nightlight_strength(strength)
             elif reset_gamma is not None:
                 try:
                     reset_gamma()
                 except Exception as e:
                     print("[WARN] Gamma ramp reset failed:", e)
+            saved_label.setText("Saved")
+
+        def cleanup():
+            if preview_button.isChecked():
+                preview_button.setChecked(False)
+
+        def temperature_changed():
+            update_label()
+            saved_label.setText("Editing\u2026")
+            if not temperature_slider.isSliderDown():
+                QTimer.singleShot(0, save_temperature)
 
         preview_button.toggled.connect(preview_toggled)
         reset_button.clicked.connect(reset_gamma_ramp)
-        temperature_slider.valueChanged.connect(lambda value: update_label())
-        temperature_slider.sliderReleased.connect(preview_temperature)
-        apply_button.clicked.connect(apply_temperature)
+        temperature_slider.valueChanged.connect(lambda value: temperature_changed())
+        temperature_slider.sliderReleased.connect(save_temperature)
         update_label()
         return {
-            "applied": applied,
             "preview_active": preview_active,
             "original_strength": original_strength,
-            "original_kelvin": original_kelvin,
+            "cleanup": cleanup,
         }
 
     def _build_light_linked_nightlight_settings(self, parent):
@@ -2260,10 +2275,11 @@ class PopupPanel(QWidget):
 
         button_row = QHBoxLayout()
         reset_button = QPushButton("Reset")
-        apply_button = QPushButton("Apply")
+        saved_label = QLabel("Saved")
+        saved_label.setStyleSheet("color: palette(mid);")
         button_row.addWidget(reset_button)
+        button_row.addWidget(saved_label)
         button_row.addStretch()
-        button_row.addWidget(apply_button)
         layout.addLayout(button_row)
         layout.addStretch()
 
@@ -2272,8 +2288,9 @@ class PopupPanel(QWidget):
             if current_light is not None:
                 editor.current_y = self._curve_value_from_points(editor.points, current_light)
             editor.update()
+            save_settings()
 
-        def apply_settings():
+        def save_settings():
             source = source_combo.currentData() or "manual"
             self.config.set("LIGHT_NIGHTLIGHT_CURVE_POINTS", list(editor.points))
             if self.on_nightlight_source_selected is not None:
@@ -2286,10 +2303,13 @@ class PopupPanel(QWidget):
                 self._set_slider_silent("nightlight", value)
                 self._safe_set_nightlight_strength(value)
                 self._remember_slider_values()
+            saved_label.setText("Saved")
 
         reset_button.clicked.connect(reset_points)
-        apply_button.clicked.connect(apply_settings)
-        return {"save": apply_settings}
+        source_combo.currentIndexChanged.connect(lambda index: save_settings())
+        editor.points_changed.connect(lambda points: saved_label.setText("Editing\u2026"))
+        editor.point_edit_finished.connect(lambda points: save_settings())
+        return {"save": lambda: None}
 
     def _ambient_config_float(self, name, default, minimum, maximum):
         try:
@@ -2415,6 +2435,15 @@ class PopupPanel(QWidget):
         ambient_curve_points = self._validated_curve_points(getattr(self.config, "AMBIENT_LIGHT_CURVE_POINTS", None))
         if ambient_curve_points is None:
             ambient_curve_points = [0, 17, 33, 50, 67, 83, 100]
+        curve_templates = {
+            "Linear": [0, 17, 33, 50, 67, 83, 100],
+            "Fast ends": [0, 38, 48, 50, 52, 62, 100],
+        }
+        curve_template_combo = QComboBox()
+        curve_template_combo.setInsertPolicy(QComboBox.NoInsert)
+        curve_template_combo.addItem("Custom")
+        curve_template_combo.addItems(curve_templates.keys())
+        add_combo_row("Proposal", curve_template_combo)
         curve_label = label("Ambient lux -> screen light", bold=True)
         curve_editor = CurveEditor(
             ambient_curve_points,
@@ -2426,6 +2455,9 @@ class PopupPanel(QWidget):
         curve_editor.setMinimumHeight(175)
         layout.addWidget(curve_label)
         layout.addWidget(curve_editor)
+        curve_saved_label = label("Saved")
+        curve_saved_label.setStyleSheet("color: palette(mid);")
+        layout.addWidget(curve_saved_label)
         layout.addStretch()
 
         def normalized_lux(lux, min_lux, max_lux):
@@ -2558,12 +2590,32 @@ class PopupPanel(QWidget):
 
         def update_curve_live(points):
             points = list(points)
+            if curve_template_combo.currentText() != "Custom":
+                curve_template_combo.setCurrentIndex(0)
             self.config._data["AMBIENT_LIGHT_CURVE_POINTS"] = points
             self.config.AMBIENT_LIGHT_CURVE_POINTS = points
+            curve_saved_label.setText("Editing\u2026")
 
         def save_curve(points):
             update_curve_live(points)
             self.config.set("AMBIENT_LIGHT_CURVE_POINTS", list(points))
+            curve_saved_label.setText("Saved")
+
+        def apply_curve_template(name):
+            points = curve_templates.get(name)
+            if points is None:
+                return
+            curve_editor.points = list(points)
+            if curve_editor.current_x is not None:
+                curve_editor.current_y = self._curve_value_from_points(
+                    curve_editor.points,
+                    curve_editor.current_x,
+                )
+            curve_editor.update()
+            self.config._data["AMBIENT_LIGHT_CURVE_POINTS"] = list(points)
+            self.config.AMBIENT_LIGHT_CURVE_POINTS = list(points)
+            self.config.set("AMBIENT_LIGHT_CURVE_POINTS", list(points))
+            curve_saved_label.setText("Saved")
 
         def format_number(value, decimals=2):
             if value is None:
@@ -2661,6 +2713,7 @@ class PopupPanel(QWidget):
             graph.add_sample(status.get("lux"), status.get("filtered_lux"), status.get("saturated"))
         curve_editor.points_changed.connect(update_curve_live)
         curve_editor.point_edit_finished.connect(save_curve)
+        curve_template_combo.currentTextChanged.connect(apply_curve_template)
         sensor_refresh_edit.editingFinished.connect(save_sensor_config)
         sensor_change_edit.editingFinished.connect(save_sensor_config)
         sensor_interval_edit.editingFinished.connect(save_sensor_config)
@@ -2821,6 +2874,9 @@ class PopupPanel(QWidget):
         layout.addWidget(light_editor)
         layout.addWidget(label("Daytime color", bold=True))
         layout.addWidget(color_editor)
+        saved_label = label("Saved")
+        saved_label.setStyleSheet("color: palette(mid);")
+        layout.addWidget(saved_label)
         layout.addStretch()
         preview_state = {"original": None}
 
@@ -2844,6 +2900,7 @@ class PopupPanel(QWidget):
             self.config.set("DAYTIME_LONGITUDE", longitude)
             self.config.set("DAYTIME_LIGHT_CURVE_POINTS", list(light_editor.points))
             self.config.set("DAYTIME_COLOR_CURVE_POINTS", list(color_editor.points))
+            saved_label.setText("Saved")
             if refresh:
                 refresh_markers()
 
@@ -2852,12 +2909,14 @@ class PopupPanel(QWidget):
             self.config.DAYTIME_LIGHT_CURVE_POINTS = list(light_editor.points)
             self.config._data["DAYTIME_COLOR_CURVE_POINTS"] = list(color_editor.points)
             self.config.DAYTIME_COLOR_CURVE_POINTS = list(color_editor.points)
+            saved_label.setText("Editing\u2026")
             refresh_markers()
 
         def save_curve():
             update_curve_live()
             self.config.set("DAYTIME_LIGHT_CURVE_POINTS", list(light_editor.points))
             self.config.set("DAYTIME_COLOR_CURVE_POINTS", list(color_editor.points))
+            saved_label.setText("Saved")
 
         def set_preview_bar_visible(visible):
             x = current_position() if visible else None
@@ -2982,7 +3041,7 @@ class PopupPanel(QWidget):
         page_stack.setStyleSheet("QStackedWidget { border: 1px solid palette(mid); }")
 
         light_tab = QWidget()
-        self._build_light_curve_settings(light_tab, include_cancel=False)
+        self._build_light_curve_settings(light_tab, include_close=False)
 
         smoothing_tab = QWidget()
         smoothing_controls = self._build_smoothing_settings(smoothing_tab)
@@ -3010,7 +3069,7 @@ class PopupPanel(QWidget):
             }
         """)
         color_tab = QWidget()
-        color_controls = self._build_nightlight_color_settings(color_tab, include_cancel=False, preview_changes=False)
+        color_controls = self._build_nightlight_color_settings(color_tab, include_close=False, preview_changes=False)
 
         gamma_tab = QWidget()
         gamma_controls = self._build_gamma_ramp_settings(gamma_tab)
@@ -3088,31 +3147,9 @@ class PopupPanel(QWidget):
             if cleanup_done["value"]:
                 return
             cleanup_done["value"] = True
-            original_target_rgb = color_controls[3]
-            applied = color_controls[4]
-            original_strength = color_controls[5]
-            original_current_rgb = color_controls[6]
-            color_preview_active = color_controls[2]
-            if color_preview_active["value"] and not applied["value"]:
-                self._safe_restore_nightlight_state(original_target_rgb, current_rgb=original_current_rgb)
-                self._set_slider_silent("nightlight", original_strength["value"])
-            elif applied["value"]:
-                self._safe_set_nightlight_strength(original_strength["value"])
-                self._set_slider_silent("nightlight", original_strength["value"])
-            if gamma_controls["preview_active"]["value"] and not gamma_controls["applied"]["value"]:
-                self.config.set("GAMMA_RAMP_WARM_KELVIN", gamma_controls["original_kelvin"])
-                if self._nightlight_backend() == NIGHTLIGHT_BACKEND_GAMMA:
-                    self._safe_set_nightlight_strength(gamma_controls["original_strength"]["value"])
-                elif reset_gamma is not None:
-                    try:
-                        reset_gamma()
-                    except Exception as e:
-                        print("[WARN] Gamma ramp reset failed:", e)
+            color_controls["cleanup"]()
+            gamma_controls["cleanup"]()
             daytime_controls["cleanup"]()
-            smoothing_controls["save"]()
-            nightlight_curve_controls["save"]()
-            daytime_controls["save"]()
-            ambient_controls["save"]()
             ambient_controls["cleanup"]()
 
         def close_display_settings():
@@ -3268,33 +3305,21 @@ class PopupPanel(QWidget):
             """)
 
     def choose_nightlight_target_color(self):
-        original_target = list(self.monitor.nightlight_get_target_rgb())
         dialog = QDialog(self)
         self._nightlight_target_dialog = dialog
         dialog.setWindowTitle("RGB color")
         dialog.setFixedSize(300, 300)
 
-        cancel_button, apply_button, preview_active, original_target_rgb, applied, original_strength, original_current_rgb = self._build_nightlight_color_settings(
+        controls = self._build_nightlight_color_settings(
             dialog,
-            include_cancel=True,
+            include_close=True,
         )
-        cancel_button.clicked.connect(dialog.reject)
-        apply_button.clicked.connect(dialog.accept)
-
-        if dialog.exec() != QDialog.Accepted:
-            self._safe_restore_nightlight_state(original_target, current_rgb=original_current_rgb)
-            self._nightlight_target_dialog = None
-            return
-
-        if not applied["value"]:
-            self._safe_restore_nightlight_state(original_target_rgb, current_rgb=original_current_rgb)
-        else:
-            self._safe_set_nightlight_strength(original_strength["value"])
-        self._set_slider_silent("nightlight", original_strength["value"])
-        self.config.set("NIGHTLIGHT_TARGET_RGB", list(self.monitor.nightlight_get_target_rgb()))
+        controls["close"].clicked.connect(dialog.accept)
+        dialog.exec()
+        controls["cleanup"]()
         self._nightlight_target_dialog = None
 
-    def _build_nightlight_color_settings(self, parent, include_cancel=True, preview_changes=True):
+    def _build_nightlight_color_settings(self, parent, include_close=True, preview_changes=True):
         layout = QVBoxLayout(parent)
         layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(8)
@@ -3437,26 +3462,23 @@ class PopupPanel(QWidget):
         layout.addLayout(tint_row)
 
         button_row = QHBoxLayout()
-        cancel_button = QPushButton("Cancel")
-        apply_button = QPushButton("Apply")
-        cancel_button.setFixedHeight(28)
-        apply_button.setFixedHeight(28)
+        close_button = QPushButton("Close")
+        close_button.setFixedHeight(28)
+        saved_label = QLabel("Saved")
+        saved_label.setStyleSheet("color: palette(mid);")
+        button_row.addWidget(saved_label)
         button_row.addStretch()
-        if include_cancel:
-            button_row.addWidget(cancel_button)
-        button_row.addWidget(apply_button)
+        if include_close:
+            button_row.addWidget(close_button)
         layout.addLayout(button_row)
 
         target_rgb = list(self.monitor.nightlight_get_target_rgb())
-        original_target_rgb = list(target_rgb)
+        committed_target_rgb = list(target_rgb)
         try:
-            original_current_rgb = list(self.monitor.get_rgb())
             original_strength = {"value": self.monitor.nightlight_get_strength()}
         except Exception:
-            original_current_rgb = list(target_rgb)
             original_strength = {"value": self.sliders["nightlight"].value()}
         preview_active = {"value": False}
-        applied = {"value": False}
         preview_strength = {"value": 100}
 
         def reset_rgb_monitor():
@@ -3481,19 +3503,6 @@ class PopupPanel(QWidget):
             )
             update_color_label(target_rgb)
 
-        def preview_target():
-            if preview_button.isChecked():
-                self._apply_nightlight_preview_rgb(
-                    target_rgb,
-                    preview_strength["value"],
-                )
-                self._set_slider_silent("nightlight", preview_strength["value"])
-            update_color_label(target_rgb)
-
-        def warmth_or_tint_released():
-            update_target_from_controls()
-            preview_target()
-
         def preview_toggled(checked):
             preview_active["value"] = checked
             preview_button.setText("Preview ON" if checked else "Preview OFF")
@@ -3504,15 +3513,14 @@ class PopupPanel(QWidget):
                 )
                 self._set_slider_silent("nightlight", preview_strength["value"])
             else:
-                self._safe_restore_nightlight_state(original_target_rgb, current_rgb=original_current_rgb)
+                self._safe_apply_nightlight_target_and_strength(
+                    committed_target_rgb,
+                    original_strength["value"],
+                )
                 self._set_slider_silent("nightlight", original_strength["value"])
 
         preview_button.toggled.connect(preview_toggled)
         reset_rgb_button.clicked.connect(reset_rgb_monitor)
-        color_slider.sliderReleased.connect(warmth_or_tint_released)
-        amber_slider.sliderReleased.connect(warmth_or_tint_released)
-        tint_slider.sliderReleased.connect(warmth_or_tint_released)
-
         color_slider.setValue(self._config_int("NIGHTLIGHT_TARGET_COLOR", 75))
         amber_slider.setValue(self._config_signed_int("NIGHTLIGHT_TARGET_AMBER", 0, -50, 50))
         tint_slider.setValue(self._config_signed_int("NIGHTLIGHT_TARGET_TINT", 0, -50, 50))
@@ -3520,20 +3528,48 @@ class PopupPanel(QWidget):
         update_color_label(target_rgb)
 
         def remember_target():
-            applied["value"] = True
             update_target_from_controls()
             self.config.set("NIGHTLIGHT_TARGET_COLOR", color_slider.value())
             self.config.set("NIGHTLIGHT_TARGET_AMBER", amber_slider.value())
             self.config.set("NIGHTLIGHT_TARGET_TINT", tint_slider.value())
             self.config.set("NIGHTLIGHT_TARGET_RGB", list(target_rgb))
             self.config.set("NIGHTLIGHT_COLOR_CURVE_POINTS", [0, 17, 33, 50, 67, 83, 100])
-            strength = self.sliders["nightlight"].value()
-            original_strength["value"] = strength
+            committed_target_rgb[:] = target_rgb
+            strength = (
+                preview_strength["value"]
+                if preview_button.isChecked()
+                else original_strength["value"]
+            )
             self._safe_apply_nightlight_target_and_strength(target_rgb, strength)
             self._set_slider_silent("nightlight", strength)
+            saved_label.setText("Saved")
 
-        apply_button.clicked.connect(remember_target)
-        return cancel_button, apply_button, preview_active, original_target_rgb, applied, original_strength, original_current_rgb
+        def target_control_released():
+            update_target_from_controls()
+            remember_target()
+
+        def cleanup():
+            if preview_button.isChecked():
+                preview_button.setChecked(False)
+
+        def target_control_changed(slider):
+            update_color_label(target_rgb)
+            saved_label.setText("Editing\u2026")
+            if not slider.isSliderDown():
+                QTimer.singleShot(0, remember_target)
+
+        color_slider.sliderReleased.connect(target_control_released)
+        amber_slider.sliderReleased.connect(target_control_released)
+        tint_slider.sliderReleased.connect(target_control_released)
+        color_slider.valueChanged.connect(lambda value: target_control_changed(color_slider))
+        amber_slider.valueChanged.connect(lambda value: target_control_changed(amber_slider))
+        tint_slider.valueChanged.connect(lambda value: target_control_changed(tint_slider))
+        return {
+            "close": close_button,
+            "cleanup": cleanup,
+            "preview_active": preview_active,
+            "original_strength": original_strength,
+        }
 
     def _rgb_to_kelvin(self, rgb):
         target_r, target_g, target_b = [
