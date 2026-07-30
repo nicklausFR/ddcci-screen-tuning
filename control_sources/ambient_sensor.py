@@ -39,14 +39,19 @@ class AmbientLightController:
         saturated = bool(saturated_value) or bool(quality is not None and quality & 1)
         lux_was_invalid = False
         try:
-            lux = max(0.0, float(lux))
+            lux = float(lux)
         except (TypeError, ValueError):
-            if not saturated:
-                return
             lux_was_invalid = True
+
+        if not lux_was_invalid and not math.isfinite(lux):
+            lux_was_invalid = True
+
+        if lux_was_invalid:
+            if not saturated:
+                return False
             lux = 20000.0
-        if saturated and lux_was_invalid:
-            lux = max(lux, 20000.0)
+        else:
+            lux = max(0.0, lux)
 
         with self._lock:
             self._last_measurement_at = time.monotonic()
@@ -69,6 +74,7 @@ class AmbientLightController:
             self._last_contrast = contrast
             if self.apply_enabled and self._should_apply(light):
                 self._apply_light(light, brightness, contrast)
+        return True
 
     def status(self):
         with self._lock:
@@ -785,6 +791,7 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
         self._measurement_event = None
         self._rx_buffer = bytearray()
         self._logged_first_measurement = False
+        self._logged_invalid_measurement = False
 
     def _log(self, message):
         print(message)
@@ -813,6 +820,7 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
         self.last_error = None
         self._rx_buffer.clear()
         self._logged_first_measurement = False
+        self._logged_invalid_measurement = False
         self.port_name = str(
             getattr(config, "AMBIENT_BLE_NAME", "LuxSensor") or "LuxSensor"
         ).strip()
@@ -1181,13 +1189,7 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
                     f"{version} is unsupported."
                 )
                 return
-            if not self._logged_first_measurement:
-                self._logged_first_measurement = True
-                self._log(
-                    f"Ambient BLE first measurement received: "
-                    f"lux={lux:.3f}, visible={visible}, quality=0x{quality:02x}."
-                )
-            self.controller.on_measurement(
+            accepted = self.controller.on_measurement(
                 lux=None if math.isnan(lux) else lux,
                 visible=visible,
                 ir=infrared,
@@ -1200,7 +1202,20 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
                     else gain_index
                 ),
             )
-            if self._measurement_event is not None:
+            if accepted and not self._logged_first_measurement:
+                self._logged_first_measurement = True
+                self._log(
+                    f"Ambient BLE first valid measurement received: "
+                    f"lux={lux:.3f}, visible={visible}, quality=0x{quality:02x}."
+                )
+            elif not accepted and not self._logged_invalid_measurement:
+                self._logged_invalid_measurement = True
+                self._log(
+                    f"[WARN] Ambient BLE rejected non-finite measurement: "
+                    f"lux={lux}, visible={visible}, ir={infrared}, "
+                    f"full={full}, quality=0x{quality:02x}."
+                )
+            if accepted and self._measurement_event is not None:
                 self._measurement_event.set()
             return
 
@@ -1225,8 +1240,8 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
                 ):
                     self._config_response_event.set()
                 if payload is not None:
-                    self.controller.on_measurement(**payload)
-                    if self._measurement_event is not None:
+                    accepted = self.controller.on_measurement(**payload)
+                    if accepted and self._measurement_event is not None:
                         self._measurement_event.set()
             except Exception as exc:
                 self._log(f"[WARN] Ambient BLE line ignored: {exc}")
