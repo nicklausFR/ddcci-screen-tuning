@@ -213,14 +213,14 @@ class DDCCI_Monitor:
             delay=delay,
         )
 
-    def get_brightness(self):
-        return self._monitor.get_brightness()
+    def get_brightness(self, use_cache=True):
+        return self._monitor.get_brightness(use_cache=use_cache)
 
     def set_brightness(self, value):
         self._monitor.set_brightness(value)
 
-    def get_contrast(self):
-        return self._monitor.get_contrast()
+    def get_contrast(self, use_cache=True):
+        return self._monitor.get_contrast(use_cache=use_cache)
 
     def set_contrast(self, value):
         self._monitor.set_contrast(value)

@@ -3,7 +3,12 @@ from PySide6.QtGui import QIcon, QFont, QAction, QActionGroup, QColor, QPainter,
 from PySide6.QtCore import Qt, QSize, QTimer, Signal
 from monitor import DDCCI_Monitor
 from ddcci_screen_tuning import PresetManager, config
-from ddcci_command_queue import submit_ddcci_command, submit_light_values
+from ddcci_command_queue import (
+    submit_brightness,
+    submit_contrast,
+    submit_ddcci_command,
+    submit_light_values,
+)
 from daytime import daytime_position, format_hour, parse_hour, solar_hours
 import sys
 import datetime
@@ -1138,6 +1143,7 @@ class PopupPanel(QWidget):
         preset_combo.addItems(self.preset_manager.get_all_names())
 
         bus.midi_update.connect(self.handle_midi_update)
+        bus.ddcci_verified.connect(self.handle_ddcci_verified)
         self.auto_source_timer = QTimer(self)
         self.auto_source_timer.timeout.connect(self._sync_active_source_sliders)
         self.auto_source_timer.start(100)
@@ -1163,11 +1169,15 @@ class PopupPanel(QWidget):
             if 'brightness' in values:
                 brightness = max(0, min(100, int(values['brightness'])))
                 self._set_slider_silent("brightness", brightness)
-                self.monitor.set_brightness(brightness)
             if 'contrast' in values:
                 contrast = max(0, min(100, int(values['contrast'])))
                 self._set_slider_silent("contrast", contrast)
-                self.monitor.set_contrast(contrast)
+            if 'brightness' in values and 'contrast' in values:
+                submit_light_values(self.monitor, brightness, contrast, "Preset light")
+            elif 'brightness' in values:
+                submit_brightness(self.monitor, brightness, "Preset brightness")
+            elif 'contrast' in values:
+                submit_contrast(self.monitor, contrast, "Preset contrast")
             if self.light_mode:
                 if 'brightness' in values:
                     self._set_slider_silent("light", self._brightness_to_light(values["brightness"]))
@@ -1177,8 +1187,7 @@ class PopupPanel(QWidget):
                     brightness, contrast = self._light_to_brightness_contrast(light)
                     self._set_slider_silent("brightness", brightness)
                     self._set_slider_silent("contrast", contrast)
-                    self.monitor.set_brightness(brightness)
-                    self.monitor.set_contrast(contrast)
+                    submit_light_values(self.monitor, brightness, contrast, "Preset light")
             if 'nightlight_neutral_rgb' in values:
                 neutral = values['nightlight_neutral_rgb']
                 if isinstance(neutral, (list, tuple)) and len(neutral) == 3:
@@ -1795,11 +1804,7 @@ class PopupPanel(QWidget):
         else:
             brightness = value
             self._set_slider_silent("brightness", brightness)
-            submit_ddcci_command(
-                "brightness",
-                "Brightness set",
-                lambda monitor=self.monitor, brightness=brightness: monitor.set_brightness(brightness),
-            )
+            submit_brightness(self.monitor, brightness)
             applied = True
         if applied:
             self._remember_slider_values()
@@ -3722,6 +3727,17 @@ class PopupPanel(QWidget):
         if key in self.sliders:
             self.sliders[key].setValue(value)
 
+    def handle_ddcci_verified(self, key, value):
+        if self._panel_closed or key not in ("brightness", "contrast"):
+            return
+        value = max(0, min(100, int(value)))
+        self._set_slider_silent(key, value)
+        config_name = "LAST_BRIGHTNESS" if key == "brightness" else "LAST_CONTRAST"
+        self.config.set(config_name, value)
+        if self.active_source == "tray":
+            tray_name = "TRAY_BRIGHTNESS" if key == "brightness" else "TRAY_CONTRAST"
+            self.config.set(tray_name, value)
+
     def set_source_control(self, source):
         source = source if source in ("tray", "ambient", "daytime") and source in self.available_sources else "tray"
         self.active_source = source
@@ -3797,25 +3813,13 @@ class PopupPanel(QWidget):
         if self.active_source == "ambient" and self.ambient_source is not None:
             status = self.ambient_source.status()
             light = status.get("light")
-            brightness = status.get("brightness")
-            contrast = status.get("contrast")
             if light is not None and "light" in self.sliders:
                 self._set_slider_silent("light", light)
-            if brightness is not None:
-                self._set_slider_silent("brightness", brightness)
-            if contrast is not None:
-                self._set_slider_silent("contrast", contrast)
         elif self.active_source == "daytime":
             light = getattr(self.config, "LAST_LIGHT", None)
-            brightness = getattr(self.config, "LAST_BRIGHTNESS", None)
-            contrast = getattr(self.config, "LAST_CONTRAST", None)
             nightlight = getattr(self.config, "LAST_NIGHTLIGHT", None)
             if light is not None and "light" in self.sliders:
                 self._set_slider_silent("light", light)
-            if brightness is not None:
-                self._set_slider_silent("brightness", brightness)
-            if contrast is not None:
-                self._set_slider_silent("contrast", contrast)
             if nightlight is not None:
                 self._set_slider_silent("nightlight", nightlight)
 
@@ -3831,25 +3835,13 @@ class PopupPanel(QWidget):
                 else:
                     brightness = value
                     self._set_slider_silent("brightness", brightness)
-                    submit_ddcci_command(
-                        "brightness",
-                        "Brightness set",
-                        lambda monitor=self.monitor, brightness=brightness: monitor.set_brightness(brightness),
-                    )
+                    submit_brightness(self.monitor, brightness)
             elif key == "brightness":
                 value = self.sliders['brightness'].value()
-                submit_ddcci_command(
-                    "brightness",
-                    "Brightness set",
-                    lambda monitor=self.monitor, value=value: monitor.set_brightness(value),
-                )
+                submit_brightness(self.monitor, value)
             elif key == "contrast":
                 value = self.sliders['contrast'].value()
-                submit_ddcci_command(
-                    "contrast",
-                    "Contrast set",
-                    lambda monitor=self.monitor, value=value: monitor.set_contrast(value),
-                )
+                submit_contrast(self.monitor, value)
             elif key == "nightlight":
                 value = self.sliders['nightlight'].value()
                 self._safe_set_nightlight_strength(value)

@@ -8,7 +8,11 @@ from gui import (
 )
 from monitor import DDCCI_Monitor, ddc_ci_monitors_list
 from ddcci_screen_tuning import config
-from ddcci_command_queue import submit_ddcci_command, submit_light_values
+from ddcci_command_queue import (
+    submit_brightness,
+    submit_ddcci_command,
+    submit_light_values,
+)
 from daytime import daytime_position, solar_hours
 from PySide6.QtCore import QObject, QTimer, Signal, Qt
 from PySide6.QtWidgets import QApplication, QCheckBox, QComboBox, QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout
@@ -668,10 +672,10 @@ class TrayControlSource:
                 else:
                     self.panel._set_slider_silent("light", light)
                     self.panel._set_slider_silent("brightness", light)
-                    submit_ddcci_command(
-                        "brightness",
+                    submit_brightness(
+                        self.panel.monitor,
+                        light,
                         "Daytime brightness",
-                        lambda monitor=self.panel.monitor, light=light: monitor.set_brightness(light),
                     )
                 self.panel._set_slider_silent("nightlight", color)
                 self.panel._safe_set_nightlight_strength(color)
@@ -684,11 +688,7 @@ class TrayControlSource:
                     config.set("LAST_CONTRAST", contrast)
                 else:
                     brightness = light
-                    submit_ddcci_command(
-                        "brightness",
-                        "Daytime brightness",
-                        lambda monitor=monitor, brightness=brightness: monitor.set_brightness(brightness),
-                    )
+                    submit_brightness(monitor, brightness, "Daytime brightness")
                 self._apply_nightlight(monitor, color, "Daytime nightlight")
                 config.set("LAST_LIGHT", light)
                 config.set("LAST_BRIGHTNESS", brightness)

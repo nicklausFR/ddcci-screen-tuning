@@ -3,6 +3,7 @@ import threading
 import time
 from monitor import DDCCI_Monitor
 from ddcci_screen_tuning import config
+from ddcci_command_queue import submit_brightness, submit_contrast, submit_light_values
 from midi_qt_signals import bus
 
 class MidiController:
@@ -150,13 +151,13 @@ class MidiController:
 
     def _handle_control(self, channel, value):
         mapping = {
-            config.MidiBrightnessChannel: ("brightness", self.monitor.set_brightness),
-            config.MidiContrastChannel: ("contrast", self.monitor.set_contrast),
-            config.MidiNightlightIntensity: ("nightlight", self.monitor.nightlight_set_strength)
+            config.MidiBrightnessChannel: "brightness",
+            config.MidiContrastChannel: "contrast",
+            config.MidiNightlightIntensity: "nightlight",
         }
 
         if channel in mapping:
-            key, action = mapping[channel]
+            key = mapping[channel]
             self.last_values[key] = value
 
             def apply():
@@ -164,10 +165,14 @@ class MidiController:
                     emit_key = key
                     if key == "brightness" and self._auto_curve_active():
                         brightness, contrast = self._light_to_brightness_contrast(value)
-                        self.monitor.set_light_values(brightness, contrast)
+                        submit_light_values(self.monitor, brightness, contrast, "MIDI light")
                         emit_key = "light"
+                    elif key == "brightness":
+                        submit_brightness(self.monitor, value, "MIDI brightness")
+                    elif key == "contrast":
+                        submit_contrast(self.monitor, value, "MIDI contrast")
                     else:
-                        action(value)
+                        self.monitor.nightlight_set_strength(value)
                     bus.midi_update.emit(emit_key, value)
                 except Exception as e:
                     print(f"[MIDI_ACTION] Channel {channel} error: {e}")

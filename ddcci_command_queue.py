@@ -16,18 +16,26 @@ class DDCCommandQueue:
     def __init__(self):
         self._condition = threading.Condition()
         self._pending = OrderedDict()
+        self._resource_versions = {}
         self._last_warning_at = {}
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    def submit(self, key, label, callback):
+    def submit(self, key, label, callback, verify=None, resources=()):
         with self._condition:
-            self._pending[key] = (label, callback)
+            resource_versions = {}
+            for resource in resources:
+                version = self._resource_versions.get(resource, 0) + 1
+                self._resource_versions[resource] = version
+                resource_versions[resource] = version
+            self._pending[key] = (label, callback, verify, resource_versions)
             self._condition.notify()
 
     def clear_pending(self):
         with self._condition:
             self._pending.clear()
+            for resource in self._resource_versions:
+                self._resource_versions[resource] += 1
 
     def _block_after_failure(self, key, label, error):
         now = time.monotonic()
@@ -41,10 +49,12 @@ class DDCCommandQueue:
             with self._condition:
                 while not self._pending:
                     self._condition.wait()
-                key, (label, callback) = self._pending.popitem(last=False)
+                key, (label, callback, verify, resource_versions) = self._pending.popitem(last=False)
 
+            succeeded = False
             try:
                 callback()
+                succeeded = True
             except Exception as e:
                 self._block_after_failure(key, label, e)
 
@@ -52,12 +62,33 @@ class DDCCommandQueue:
             if delay > 0:
                 time.sleep(delay)
 
+            if succeeded and verify is not None:
+                with self._condition:
+                    latest_resources = {
+                        resource
+                        for resource, version in resource_versions.items()
+                        if self._resource_versions.get(resource) == version
+                    }
+                if latest_resources:
+                    try:
+                        verify(latest_resources)
+                    except Exception as e:
+                        self._block_after_failure(key, f"{label} verification", e)
+                    if delay > 0:
+                        time.sleep(delay)
+
 
 ddc_command_queue = DDCCommandQueue()
 
 
-def submit_ddcci_command(key, label, callback):
-    ddc_command_queue.submit(key, label, callback)
+def submit_ddcci_command(key, label, callback, verify=None, resources=()):
+    ddc_command_queue.submit(
+        key,
+        label,
+        callback,
+        verify=verify,
+        resources=resources,
+    )
 
 
 def clear_pending_ddcci_commands():
@@ -71,4 +102,63 @@ def submit_light_values(monitor, brightness, contrast, label="Auto curve"):
     def apply_values():
         monitor.set_light_values(brightness, contrast)
 
-    submit_ddcci_command("light", label, apply_values)
+    def verify_values(resources):
+        from midi_qt_signals import bus
+        if "brightness" in resources:
+            actual_brightness = monitor.get_brightness(use_cache=False)
+            bus.ddcci_verified.emit("brightness", actual_brightness)
+        if "brightness" in resources and "contrast" in resources:
+            delay = ddcci_command_delay()
+            if delay > 0:
+                time.sleep(delay)
+        if "contrast" in resources:
+            actual_contrast = monitor.get_contrast(use_cache=False)
+            bus.ddcci_verified.emit("contrast", actual_contrast)
+
+    submit_ddcci_command(
+        "light",
+        label,
+        apply_values,
+        verify=verify_values,
+        resources=("brightness", "contrast"),
+    )
+
+
+def submit_brightness(monitor, value, label="Brightness set"):
+    value = max(0, min(100, round(value)))
+
+    def apply_value():
+        monitor.set_brightness(value)
+
+    def verify_value(_resources):
+        actual = monitor.get_brightness(use_cache=False)
+        from midi_qt_signals import bus
+        bus.ddcci_verified.emit("brightness", actual)
+
+    submit_ddcci_command(
+        "brightness",
+        label,
+        apply_value,
+        verify=verify_value,
+        resources=("brightness",),
+    )
+
+
+def submit_contrast(monitor, value, label="Contrast set"):
+    value = max(0, min(100, round(value)))
+
+    def apply_value():
+        monitor.set_contrast(value)
+
+    def verify_value(_resources):
+        actual = monitor.get_contrast(use_cache=False)
+        from midi_qt_signals import bus
+        bus.ddcci_verified.emit("contrast", actual)
+
+    submit_ddcci_command(
+        "contrast",
+        label,
+        apply_value,
+        verify=verify_value,
+        resources=("contrast",),
+    )

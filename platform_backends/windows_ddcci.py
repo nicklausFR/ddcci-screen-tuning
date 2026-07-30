@@ -220,11 +220,6 @@ class WindowsDDCIMonitor:
         value = int(value)
         with self._vcp_lock:
             self._ensure_open()
-            cached = self._get_cached_vcp(code)
-            if cached is not None and cached[0] == value:
-                return
-
-            maximum_value = cached[1] if cached is not None else 100
             last_error = 0
             for attempt in range(1, max_attempts + 1):
                 with VCP_LOCK:
@@ -232,7 +227,11 @@ class WindowsDDCIMonitor:
                 if success:
                     if attempt > 1:
                         print(f"  VCP 0x{code:02X} written successfully on attempt {attempt}")
-                    self._cache_vcp(code, value, maximum_value)
+                    # A cached read is not proof that the monitor still has this
+                    # value, and a successful write is not proof that the monitor
+                    # accepted it unchanged. Never skip an explicit request and
+                    # never cache the requested value as if it had been read back.
+                    self._vcp_cache.pop(code, None)
                     return
                 last_error = ctypes.get_last_error()
                 time.sleep(delay)
@@ -242,14 +241,14 @@ class WindowsDDCIMonitor:
             f"(GetLastError={last_error})"
         )
 
-    def get_brightness(self):
-        return self.get_vcp(VCP_BRIGHTNESS)[0]
+    def get_brightness(self, use_cache=True):
+        return self.get_vcp(VCP_BRIGHTNESS, use_cache=use_cache)[0]
 
     def set_brightness(self, value):
         self.set_vcp(VCP_BRIGHTNESS, max(0, min(100, round(value))))
 
-    def get_contrast(self):
-        return self.get_vcp(VCP_CONTRAST)[0]
+    def get_contrast(self, use_cache=True):
+        return self.get_vcp(VCP_CONTRAST, use_cache=use_cache)[0]
 
     def set_contrast(self, value):
         self.set_vcp(VCP_CONTRAST, max(0, min(100, round(value))))

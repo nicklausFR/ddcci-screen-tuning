@@ -11,6 +11,7 @@ class MidiQTSignalBus(QObject):
         value : valeur entre 0 et 100
     """
     midi_update = Signal(str, int)
+    ddcci_verified = Signal(str, int)
 
 # Global instance used by the project
 bus = MidiQTSignalBus()

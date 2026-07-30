@@ -8,7 +8,7 @@ import threading
 import time
 from pathlib import Path
 
-from ddcci_command_queue import submit_ddcci_command, submit_light_values
+from ddcci_command_queue import submit_brightness, submit_light_values
 from ddcci_screen_tuning import config
 from monitor import DDCCI_Monitor, ddc_ci_monitors_list
 
@@ -221,11 +221,7 @@ class AmbientLightController:
             submit_light_values(monitor, brightness, contrast, "Ambient sensor light")
         else:
             brightness = max(0, min(100, round(light)))
-            submit_ddcci_command(
-                "brightness",
-                "Ambient sensor brightness",
-                lambda monitor=monitor, brightness=brightness: monitor.set_brightness(brightness),
-            )
+            submit_brightness(monitor, brightness, "Ambient sensor brightness")
             contrast = self._last_contrast
         self._last_applied_light = light
         config.set("LAST_LIGHT", light)
