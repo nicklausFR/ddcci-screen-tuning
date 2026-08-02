@@ -29,11 +29,15 @@ class AmbientLightController:
         self._last_saturated = None
         self._last_quality = None
         self._last_range = None
+        self._last_battery_percent = None
+        self._last_battery_voltage = None
         self._last_brightness = None
         self._last_contrast = None
         self._lock = threading.Lock()
 
-    def on_measurement(self, lux, visible=None, ir=None, full=None, saturated=None, quality=None, range_id=None):
+    def on_measurement(self, lux, visible=None, ir=None, full=None,
+                       saturated=None, quality=None, range_id=None,
+                       battery_percent=None, battery_voltage=None):
         quality = self._optional_int(quality)
         saturated_value = self._optional_bool(saturated)
         saturated = bool(saturated_value) or bool(quality is not None and quality & 1)
@@ -62,6 +66,8 @@ class AmbientLightController:
             self._last_saturated = saturated
             self._last_quality = quality
             self._last_range = range_id
+            self._last_battery_percent = self._optional_int(battery_percent)
+            self._last_battery_voltage = battery_voltage
             self._filtered_lux = self._smooth_lux(lux)
             light = self._lux_to_light(self._filtered_lux)
             if self._auto_curve_active():
@@ -91,6 +97,8 @@ class AmbientLightController:
                 "saturated": self._last_saturated,
                 "quality": self._last_quality,
                 "range": self._last_range,
+                "battery_percent": self._last_battery_percent,
+                "battery_voltage": self._last_battery_voltage,
                 "age": age,
                 "light": self._last_light,
                 "brightness": self._last_brightness,
@@ -603,7 +611,10 @@ class UsbSerialAmbientReader:
             return False
         cmd = data.get("cmd")
         if data.get("ok") is False:
-            self._last_config_error = data.get("error") or "command_failed"
+            # A failed measurement request (for example no_cached_reading
+            # during sensor startup) must not abort an unrelated config.set.
+            if cmd in ("config.get", "config.set", "config.reset"):
+                self._last_config_error = data.get("error") or "command_failed"
             return True
         if cmd in ("config.get", "config.set", "config.reset") and isinstance(data.get("config"), dict):
             self._last_config = dict(data["config"])
@@ -619,6 +630,8 @@ class UsbSerialAmbientReader:
             "publishLuxChangePercent": "AMBIENT_SENSOR_PUBLISH_LUX_CHANGE_PERCENT",
             "publishMaxIntervalSeconds": "AMBIENT_SENSOR_PUBLISH_MAX_INTERVAL_SECONDS",
             "publishMode": "AMBIENT_SENSOR_PUBLISH_MODE",
+            "ledBrightness": "AMBIENT_SENSOR_LED_BRIGHTNESS",
+            "ledBlinkIntervalMs": "AMBIENT_SENSOR_LED_BLINK_INTERVAL_MS",
         }
         for source, target in mapping.items():
             if source in runtime_config:
@@ -774,7 +787,9 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
     NUS_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
     NUS_RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
     NUS_TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
-    MEASUREMENT_PACKET = struct.Struct("<2sBBfHHHB")
+    MEASUREMENT_PACKET_V1 = struct.Struct("<2sBBfHHHB")
+    MEASUREMENT_PACKET_V2 = struct.Struct("<2sBBfHHHBHB")
+    MEASUREMENT_PACKET = MEASUREMENT_PACKET_V2
     GAIN_NAMES = ("low", "med", "high", "max")
 
     def __init__(self, controller):
@@ -958,6 +973,12 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
             ),
             "publishMode": self._config_publish_mode(
                 "AMBIENT_SENSOR_PUBLISH_MODE", "auto"
+            ),
+            "ledBrightness": self._config_int(
+                "AMBIENT_SENSOR_LED_BRIGHTNESS", 32, 0, 255
+            ),
+            "ledBlinkIntervalMs": self._config_int(
+                "AMBIENT_SENSOR_LED_BLINK_INTERVAL_MS", 5000, 500, 60000
             ),
         }
 
@@ -1165,21 +1186,23 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
             raise
 
     def _on_notification(self, _sender, data):
-        if (
-            len(data) == self.MEASUREMENT_PACKET.size
-            and data[:2] == b"LT"
+        if data[:2] == b"LT" and len(data) in (
+            self.MEASUREMENT_PACKET_V1.size,
+            self.MEASUREMENT_PACKET_V2.size,
         ):
-            (
-                _magic,
-                version,
-                quality,
-                lux,
-                visible,
-                infrared,
-                full,
-                gain_index,
-            ) = self.MEASUREMENT_PACKET.unpack(data)
-            if version != 1:
+            version = data[2]
+            if version == 1 and len(data) == self.MEASUREMENT_PACKET_V1.size:
+                (
+                    _magic, _version, quality, lux, visible, infrared, full,
+                    gain_index,
+                ) = self.MEASUREMENT_PACKET_V1.unpack(data)
+                battery_mv = battery_percent = None
+            elif version == 2 and len(data) == self.MEASUREMENT_PACKET_V2.size:
+                (
+                    _magic, _version, quality, lux, visible, infrared, full,
+                    gain_index, battery_mv, battery_percent,
+                ) = self.MEASUREMENT_PACKET_V2.unpack(data)
+            else:
                 self._log(
                     f"[WARN] Ambient BLE measurement version "
                     f"{version} is unsupported."
@@ -1197,6 +1220,8 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
                     if gain_index < len(self.GAIN_NAMES)
                     else gain_index
                 ),
+                battery_percent=battery_percent,
+                battery_voltage=(battery_mv / 1000.0 if battery_mv is not None else None),
             )
             if accepted and not self._logged_first_measurement:
                 self._logged_first_measurement = True
@@ -1324,6 +1349,14 @@ class AmbientSensorControlSource:
 
     def is_running(self):
         return self.reader.running
+
+    def is_transport_available(self):
+        """Whether the configured sensor transport can be started.
+
+        This is intentionally different from is_available(), which becomes
+        true only after the sensor has connected and delivered a reading.
+        """
+        return self.reader.is_port_available()
 
     def recalculate_current(self):
         return self.controller.recalculate_current()

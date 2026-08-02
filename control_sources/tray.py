@@ -341,10 +341,12 @@ class TrayControlSource:
 
     def _available_sources(self):
         sources = {"tray", "daytime"}
+        # Keep Sensor selectable before the first BLE connection. Previously
+        # the panel only showed it after is_available() became true, even
+        # though selecting it is what starts the BLE reader.
         if (
             self.ambient_source is not None
-            and self._ambient_watch_enabled
-            and self.ambient_source.is_available()
+            and self.ambient_source.is_transport_available()
         ):
             sources.add("ambient")
         return sources

@@ -2411,6 +2411,10 @@ class PopupPanel(QWidget):
         sensor_change_row = add_value_row("Push change %", sensor_change_edit, advanced_layout)
         sensor_interval_edit = QLineEdit(str(self._config_int("AMBIENT_SENSOR_PUBLISH_MAX_INTERVAL_SECONDS", 30)))
         sensor_interval_row = add_value_row("Max push interval s", sensor_interval_edit, advanced_layout)
+        sensor_led_brightness_edit = QLineEdit(str(self._config_signed_int("AMBIENT_SENSOR_LED_BRIGHTNESS", 32, 0, 255)))
+        sensor_led_brightness_row = add_value_row("LED brightness (0-255)", sensor_led_brightness_edit, advanced_layout)
+        sensor_led_blink_interval_edit = QLineEdit(str(self._config_signed_int("AMBIENT_SENSOR_LED_BLINK_INTERVAL_MS", 5000, 500, 60000)))
+        sensor_led_blink_interval_row = add_value_row("LED blink interval ms", sensor_led_blink_interval_edit, advanced_layout)
         sensor_status_label = label("")
         advanced_layout.addWidget(sensor_status_label)
         sensor_reconnect_button = QPushButton("Force reconnect")
@@ -2423,6 +2427,8 @@ class PopupPanel(QWidget):
                 "publishLuxChangePercent": self._ambient_config_float("AMBIENT_SENSOR_PUBLISH_LUX_CHANGE_PERCENT", 1.0, 0.0, 100.0),
                 "publishMaxIntervalSeconds": self._config_int("AMBIENT_SENSOR_PUBLISH_MAX_INTERVAL_SECONDS", 30),
                 "publishMode": sensor_mode if sensor_mode in ("auto", "interval") else "auto",
+                "ledBrightness": self._config_signed_int("AMBIENT_SENSOR_LED_BRIGHTNESS", 32, 0, 255),
+                "ledBlinkIntervalMs": self._config_signed_int("AMBIENT_SENSOR_LED_BLINK_INTERVAL_MS", 5000, 500, 60000),
             }
         }
         sensor_config_pending = {"values": None, "sent_at": None}
@@ -2512,6 +2518,8 @@ class PopupPanel(QWidget):
                 "publishLuxChangePercent": parse_float(sensor_change_edit, 1.0, 0.0, 100.0),
                 "publishMaxIntervalSeconds": parse_int(sensor_interval_edit, 30, 1, 86400),
                 "publishMode": mode,
+                "ledBrightness": parse_int(sensor_led_brightness_edit, 32, 0, 255),
+                "ledBlinkIntervalMs": parse_int(sensor_led_blink_interval_edit, 5000, 500, 60000),
             }
 
         def update_sensor_config_visibility():
@@ -2519,12 +2527,16 @@ class PopupPanel(QWidget):
             sensor_change_row.setVisible(not interval_mode)
             sensor_interval_row.setVisible(True)
             sensor_refresh_row.setVisible(True)
+            sensor_led_brightness_row.setVisible(True)
+            sensor_led_blink_interval_row.setVisible(True)
 
         def set_sensor_config_fields(values):
             sensor_config_updating["active"] = True
             sensor_refresh_edit.setText(str(values["refreshMs"]))
             sensor_change_edit.setText(f"{float(values['publishLuxChangePercent']):g}")
             sensor_interval_edit.setText(str(values["publishMaxIntervalSeconds"]))
+            sensor_led_brightness_edit.setText(str(values["ledBrightness"]))
+            sensor_led_blink_interval_edit.setText(str(values["ledBlinkIntervalMs"]))
             index = sensor_mode_combo.findData(values["publishMode"])
             sensor_mode_combo.setCurrentIndex(index if index >= 0 else 0)
             update_sensor_config_visibility()
@@ -2534,6 +2546,8 @@ class PopupPanel(QWidget):
             sensor_refresh_edit.setEnabled(enabled)
             sensor_change_edit.setEnabled(enabled)
             sensor_interval_edit.setEnabled(enabled)
+            sensor_led_brightness_edit.setEnabled(enabled)
+            sensor_led_blink_interval_edit.setEnabled(enabled)
             sensor_mode_combo.setEnabled(enabled)
 
         def remember_sensor_config(values, save_file=True):
@@ -2543,6 +2557,8 @@ class PopupPanel(QWidget):
                 self.config.set("AMBIENT_SENSOR_PUBLISH_LUX_CHANGE_PERCENT", values["publishLuxChangePercent"])
                 self.config.set("AMBIENT_SENSOR_PUBLISH_MAX_INTERVAL_SECONDS", values["publishMaxIntervalSeconds"])
                 self.config.set("AMBIENT_SENSOR_PUBLISH_MODE", values["publishMode"])
+                self.config.set("AMBIENT_SENSOR_LED_BRIGHTNESS", values["ledBrightness"])
+                self.config.set("AMBIENT_SENSOR_LED_BLINK_INTERVAL_MS", values["ledBlinkIntervalMs"])
 
         def save_sensor_config():
             if sensor_config_updating["active"]:
@@ -2677,6 +2693,8 @@ class PopupPanel(QWidget):
                     "publishLuxChangePercent": float(runtime_config.get("publishLuxChangePercent", sensor_config_last["values"]["publishLuxChangePercent"])),
                     "publishMaxIntervalSeconds": int(runtime_config.get("publishMaxIntervalSeconds", sensor_config_last["values"]["publishMaxIntervalSeconds"])),
                     "publishMode": runtime_config.get("publishMode") if runtime_config.get("publishMode") in ("auto", "interval") else sensor_config_last["values"]["publishMode"],
+                    "ledBrightness": int(runtime_config.get("ledBrightness", sensor_config_last["values"]["ledBrightness"])),
+                    "ledBlinkIntervalMs": int(runtime_config.get("ledBlinkIntervalMs", sensor_config_last["values"]["ledBlinkIntervalMs"])),
                 }
                 save_runtime = sensor_config_pending["values"] is not None
                 remember_sensor_config(runtime_values, save_file=save_runtime)
@@ -2690,6 +2708,10 @@ class PopupPanel(QWidget):
                     sensor_change_edit.setText(f"{float(runtime_config['publishLuxChangePercent']):g}")
                 if not sensor_interval_edit.hasFocus() and "publishMaxIntervalSeconds" in runtime_config:
                     sensor_interval_edit.setText(str(runtime_config["publishMaxIntervalSeconds"]))
+                if not sensor_led_brightness_edit.hasFocus() and "ledBrightness" in runtime_config:
+                    sensor_led_brightness_edit.setText(str(runtime_config["ledBrightness"]))
+                if not sensor_led_blink_interval_edit.hasFocus() and "ledBlinkIntervalMs" in runtime_config:
+                    sensor_led_blink_interval_edit.setText(str(runtime_config["ledBlinkIntervalMs"]))
                 mode = runtime_config.get("publishMode")
                 if mode in ("auto", "interval") and not sensor_mode_combo.hasFocus():
                     index = sensor_mode_combo.findData(mode)
@@ -2722,6 +2744,8 @@ class PopupPanel(QWidget):
         sensor_refresh_edit.editingFinished.connect(save_sensor_config)
         sensor_change_edit.editingFinished.connect(save_sensor_config)
         sensor_interval_edit.editingFinished.connect(save_sensor_config)
+        sensor_led_brightness_edit.editingFinished.connect(save_sensor_config)
+        sensor_led_blink_interval_edit.editingFinished.connect(save_sensor_config)
         def sensor_mode_changed(index):
             update_sensor_config_visibility()
             save_sensor_config()
@@ -3754,7 +3778,10 @@ class PopupPanel(QWidget):
         if available:
             self.available_sources.add(source)
         else:
-            self.available_sources.discard(source)
+            # Sensor must remain selectable after a failed discovery so the
+            # user can start or retry the BLE connection from the panel.
+            if source != "ambient":
+                self.available_sources.discard(source)
             if self.active_source == source:
                 self.active_source = "tray"
         self._populate_source_selector()
@@ -3771,13 +3798,21 @@ class PopupPanel(QWidget):
         self.source_selector.clear()
         self.source_selector.addItem("Manual", "tray")
         if "ambient" in self.available_sources:
-            self.source_selector.addItem("Sensor", "ambient")
+            self.source_selector.addItem(self._ambient_source_label(), "ambient")
         if "daytime" in self.available_sources:
             self.source_selector.addItem("Daytime", "daytime")
         index = self.source_selector.findData(current)
         self.source_selector.setCurrentIndex(index if index >= 0 else 0)
         self.active_source = self.source_selector.currentData() or "tray"
         self._updating_source_selector = False
+
+    def _ambient_source_label(self):
+        if self.ambient_source is None:
+            return "Sensor"
+        percent = self.ambient_source.status().get("battery_percent")
+        if percent is None:
+            return "Sensor"
+        return f"Sensor {max(0, min(100, int(percent)))}%"
 
     def set_nightlight_source_control(self, source):
         source = source if source in ("manual", "daytime", "light_linked") else "manual"
@@ -3810,6 +3845,12 @@ class PopupPanel(QWidget):
             self.on_nightlight_source_selected(source)
 
     def _sync_active_source_sliders(self):
+        if hasattr(self, "source_selector"):
+            index = self.source_selector.findData("ambient")
+            if index >= 0:
+                label = self._ambient_source_label()
+                if self.source_selector.itemText(index) != label:
+                    self.source_selector.setItemText(index, label)
         if self.active_source == "ambient" and self.ambient_source is not None:
             status = self.ambient_source.status()
             light = status.get("light")
