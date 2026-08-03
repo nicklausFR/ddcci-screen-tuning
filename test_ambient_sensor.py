@@ -1,7 +1,8 @@
 import math
 import unittest
+from unittest.mock import Mock, patch
 
-from control_sources.ambient_sensor import AmbientLightController
+from control_sources.ambient_sensor import AmbientLightController, AmbientSensorControlSource
 
 
 class AmbientLightControllerMeasurementTests(unittest.TestCase):
@@ -43,6 +44,23 @@ class AmbientLightControllerMeasurementTests(unittest.TestCase):
 
         self.assertTrue(accepted)
         self.assertEqual(self.controller.status()["lux"], 20000.0)
+
+    def test_enabling_sensor_reapplies_cached_measurement(self):
+        source = AmbientSensorControlSource.__new__(AmbientSensorControlSource)
+        source.controller = Mock()
+        source.reader = Mock()
+        source.reader.start.return_value = True
+
+        class FakeConfig:
+            def set(self, _name, _value):
+                pass
+
+        with patch("control_sources.ambient_sensor.config", FakeConfig()):
+            self.assertTrue(source.set_enabled(True))
+
+        source.controller.force_next_apply.assert_called_once_with()
+        source.controller.recalculate_current.assert_called_once_with()
+        source.reader.start.assert_called_once_with()
 
 
 if __name__ == "__main__":

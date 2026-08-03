@@ -9,6 +9,7 @@ from gui import (
 from monitor import DDCCI_Monitor, ddc_ci_monitors_list
 from ddcci_screen_tuning import config
 from ddcci_command_queue import (
+    clear_pending_ddcci_commands,
     submit_brightness,
     submit_ddcci_command,
     submit_light_values,
@@ -92,6 +93,9 @@ class TrayControlSource:
         return self.tray_icon
 
     def select_source(self, source):
+        # An already queued command from the previous source must never win
+        # after the user has selected another controller.
+        clear_pending_ddcci_commands()
         if source == "ambient":
             self.set_daytime_enabled(False)
             if self.ambient_source is not None and self.ambient_source.set_enabled(True):

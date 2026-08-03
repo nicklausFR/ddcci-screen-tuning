@@ -1299,6 +1299,10 @@ class AmbientSensorControlSource:
         self.controller.apply_enabled = enabled
         if enabled:
             self.controller.force_next_apply()
+            # Switching back to Sensor must apply its most recent reading
+            # immediately. Waiting for a changed measurement leaves the
+            # display at the previous Manual value indefinitely.
+            self.controller.recalculate_current()
             return self.reader.start()
         self.controller.close()
         return True

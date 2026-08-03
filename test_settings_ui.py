@@ -140,6 +140,20 @@ class SettingsUiTests(unittest.TestCase):
         color_slider.sliderReleased.emit()
         self.assertEqual(self.panel.config.NIGHTLIGHT_TARGET_COLOR, 80)
 
+    def test_automatic_source_locks_light_sliders(self):
+        self.panel.active_source = "ambient"
+        self.panel._update_light_controls_enabled()
+
+        for key in ("light", "brightness", "contrast"):
+            self.assertFalse(self.panel.sliders[key].isEnabled())
+
+        self.panel.active_source = "tray"
+        self.panel._detail_rows_visible = True
+        self.panel._update_light_controls_enabled()
+
+        for key in ("light", "brightness", "contrast"):
+            self.assertTrue(self.panel.sliders[key].isEnabled())
+
 
 if __name__ == "__main__":
     unittest.main()

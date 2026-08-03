@@ -1131,6 +1131,7 @@ class PopupPanel(QWidget):
             layout.addLayout(row)
 
         self._load_cached_values()
+        self._update_light_controls_enabled()
 
         preset_combo = QComboBox()
         preset_combo.setInsertPolicy(QComboBox.NoInsert)
@@ -1569,6 +1570,7 @@ class PopupPanel(QWidget):
         self.setFixedSize(280, height)
         self.bg.setGeometry(0, 0, 280, height)
         self._update_bc_link_bracket(linked)
+        self._update_light_controls_enabled()
         QTimer.singleShot(0, lambda: self._update_bc_link_bracket(linked))
         self.place_bottom_right()
 
@@ -3771,6 +3773,24 @@ class PopupPanel(QWidget):
                 self._updating_source_selector = True
                 self.source_selector.setCurrentIndex(index)
                 self._updating_source_selector = False
+        self._update_light_controls_enabled()
+
+    def _update_light_controls_enabled(self):
+        """Only Manual is allowed to change display light controls directly."""
+        if not hasattr(self, "sliders"):
+            return
+
+        manual_control = self.active_source == "tray"
+        for key in ("light", "brightness", "contrast"):
+            slider = self.sliders.get(key)
+            if slider is None:
+                continue
+            linked_detail_row = (
+                key in ("brightness", "contrast")
+                and self.light_mode
+                and not self._detail_rows_visible
+            )
+            slider.setEnabled(manual_control and not linked_detail_row)
 
     def set_source_available(self, source, available):
         if source not in ("ambient", "daytime"):

@@ -242,25 +242,40 @@ class WindowsDDCIMonitor:
         )
 
     def get_brightness(self, use_cache=True):
-        return self.get_vcp(VCP_BRIGHTNESS, use_cache=use_cache)[0]
+        return self._get_percent_vcp(VCP_BRIGHTNESS, use_cache=use_cache)
 
     def set_brightness(self, value):
-        self.set_vcp(VCP_BRIGHTNESS, max(0, min(100, round(value))))
+        self._set_percent_vcp(VCP_BRIGHTNESS, value)
 
     def get_contrast(self, use_cache=True):
-        return self.get_vcp(VCP_CONTRAST, use_cache=use_cache)[0]
+        return self._get_percent_vcp(VCP_CONTRAST, use_cache=use_cache)
 
     def set_contrast(self, value):
-        self.set_vcp(VCP_CONTRAST, max(0, min(100, round(value))))
+        self._set_percent_vcp(VCP_CONTRAST, value)
 
     def get_rgb(self):
         return (
-            self.get_vcp(VCP_GAIN_R)[0],
-            self.get_vcp(VCP_GAIN_G)[0],
-            self.get_vcp(VCP_GAIN_B)[0],
+            self._get_percent_vcp(VCP_GAIN_R),
+            self._get_percent_vcp(VCP_GAIN_G),
+            self._get_percent_vcp(VCP_GAIN_B),
         )
 
     def set_rgb(self, r, g, b):
-        self.set_vcp(VCP_GAIN_R, max(0, min(100, int(r))))
-        self.set_vcp(VCP_GAIN_G, max(0, min(100, int(g))))
-        self.set_vcp(VCP_GAIN_B, max(0, min(100, int(b))))
+        self._set_percent_vcp(VCP_GAIN_R, r)
+        self._set_percent_vcp(VCP_GAIN_G, g)
+        self._set_percent_vcp(VCP_GAIN_B, b)
+
+    def _get_percent_vcp(self, code, use_cache=True):
+        """Return a VCP value on the UI's fixed 0--100 scale."""
+        current, maximum = self.get_vcp(code, use_cache=use_cache)
+        if maximum <= 0:
+            raise RuntimeError(f"VCP 0x{code:02X} reported an invalid maximum of {maximum}.")
+        return max(0, min(100, round(current * 100 / maximum)))
+
+    def _set_percent_vcp(self, code, value):
+        """Map a UI percentage to the monitor's own advertised VCP range."""
+        percent = max(0, min(100, round(value)))
+        _current, maximum = self.get_vcp(code)
+        if maximum <= 0:
+            raise RuntimeError(f"VCP 0x{code:02X} reported an invalid maximum of {maximum}.")
+        self.set_vcp(code, round(percent * maximum / 100))
