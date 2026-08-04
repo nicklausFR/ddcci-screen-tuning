@@ -94,7 +94,7 @@ python main.py
 
 ```powershell
 python -m pip install pyinstaller
-pyinstaller main.py --onefile --windowed --name ddcci-screen-tuning
+pyinstaller main.py --onefile --windowed --name ddcci-screen-tuning --add-data "icons;icons"
 ```
 
 Keep `config.yaml` next to the generated executable to override the built-in
