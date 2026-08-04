@@ -33,7 +33,6 @@ else:
 LIGHT_CURVE_POINT_COUNT = 7
 NIGHTLIGHT_BACKEND_DDCCI = "ddcci_rgb"
 NIGHTLIGHT_BACKEND_GAMMA = "gamma_ramp"
-
 # Countries are split only when the mainland span is roughly above this
 # threshold north-south or east-west. Smaller countries keep one entry.
 DAYTIME_LOCATION_SPLIT_THRESHOLD_KM = 1500
@@ -3829,7 +3828,10 @@ class PopupPanel(QWidget):
     def _ambient_source_label(self):
         if self.ambient_source is None:
             return "Sensor"
-        percent = self.ambient_source.status().get("battery_percent")
+        status = self.ambient_source.status()
+        percent = status.get("battery_percent")
+        if status.get("usb_connected") is True:
+            return "Sensor en charge"
         if percent is None:
             return "Sensor"
         return f"Sensor {max(0, min(100, int(percent)))}%"

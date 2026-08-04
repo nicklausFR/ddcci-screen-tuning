@@ -31,13 +31,15 @@ class AmbientLightController:
         self._last_range = None
         self._last_battery_percent = None
         self._last_battery_voltage = None
+        self._last_usb_connected = None
         self._last_brightness = None
         self._last_contrast = None
         self._lock = threading.Lock()
 
     def on_measurement(self, lux, visible=None, ir=None, full=None,
                        saturated=None, quality=None, range_id=None,
-                       battery_percent=None, battery_voltage=None):
+                       battery_percent=None, battery_voltage=None,
+                       usb_connected=None):
         quality = self._optional_int(quality)
         saturated_value = self._optional_bool(saturated)
         saturated = bool(saturated_value) or bool(quality is not None and quality & 1)
@@ -68,6 +70,8 @@ class AmbientLightController:
             self._last_range = range_id
             self._last_battery_percent = self._optional_int(battery_percent)
             self._last_battery_voltage = battery_voltage
+            if usb_connected is not None:
+                self._last_usb_connected = self._optional_bool(usb_connected)
             self._filtered_lux = self._smooth_lux(lux)
             light = self._lux_to_light(self._filtered_lux)
             if self._auto_curve_active():
@@ -99,11 +103,27 @@ class AmbientLightController:
                 "range": self._last_range,
                 "battery_percent": self._last_battery_percent,
                 "battery_voltage": self._last_battery_voltage,
+                "usb_connected": self._last_usb_connected,
                 "age": age,
                 "light": self._last_light,
                 "brightness": self._last_brightness,
                 "contrast": self._last_contrast,
             }
+
+    def on_usb_state(self, connected, battery_percent=None,
+                     battery_voltage=None):
+        connected = self._optional_bool(connected)
+        if connected is None:
+            return False
+        with self._lock:
+            self._last_usb_connected = connected
+            if battery_percent is not None:
+                self._last_battery_percent = self._optional_int(
+                    battery_percent
+                )
+            if battery_voltage is not None:
+                self._last_battery_voltage = battery_voltage
+        return True
 
     def recalculate_current(self):
         with self._lock:
@@ -601,6 +621,27 @@ class UsbSerialAmbientReader:
         if not isinstance(data, dict):
             return None
 
+        if data.get("type") == "usb" and "connected" in data:
+            connected = self._optional_bool(data.get("connected"))
+            battery_mv = data.get("batteryMillivolts")
+            battery_percent = data.get("batteryPercent")
+            battery_voltage = None
+            if battery_mv is not None:
+                try:
+                    battery_voltage = float(battery_mv) / 1000.0
+                except (TypeError, ValueError):
+                    battery_voltage = None
+            self._log(
+                f"Ambient BLE USB event received: connected={connected}, "
+                f"battery={battery_percent}% ({battery_mv}mV)."
+            )
+            self.controller.on_usb_state(
+                connected,
+                battery_percent=battery_percent,
+                battery_voltage=battery_voltage,
+            )
+            return None
+
         if self._handle_response(data):
             return None
         data = self._flatten_measurement_dict(data)
@@ -789,7 +830,8 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
     NUS_TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
     MEASUREMENT_PACKET_V1 = struct.Struct("<2sBBfHHHB")
     MEASUREMENT_PACKET_V2 = struct.Struct("<2sBBfHHHBHB")
-    MEASUREMENT_PACKET = MEASUREMENT_PACKET_V2
+    MEASUREMENT_PACKET_V3 = struct.Struct("<2sBBfHHHBHBB")
+    MEASUREMENT_PACKET = MEASUREMENT_PACKET_V3
     GAIN_NAMES = ("low", "med", "high", "max")
 
     def __init__(self, controller):
@@ -803,13 +845,16 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
         self._rx_buffer = bytearray()
         self._logged_first_measurement = False
         self._logged_invalid_measurement = False
+        self._last_logged_usb_connected = None
 
     def _log(self, message):
         print(message)
-        if not getattr(sys, "frozen", False):
-            return
         try:
-            log_path = Path(sys.executable).resolve().parent / "ambient_ble.log"
+            if getattr(sys, "frozen", False):
+                log_dir = Path(sys.executable).resolve().parent
+            else:
+                log_dir = Path(__file__).resolve().parents[1]
+            log_path = log_dir / "ambient_ble.log"
             timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
             with log_path.open("a", encoding="utf-8") as log_file:
                 log_file.write(f"{timestamp} {message}\n")
@@ -1189,6 +1234,7 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
         if data[:2] == b"LT" and len(data) in (
             self.MEASUREMENT_PACKET_V1.size,
             self.MEASUREMENT_PACKET_V2.size,
+            self.MEASUREMENT_PACKET_V3.size,
         ):
             version = data[2]
             if version == 1 and len(data) == self.MEASUREMENT_PACKET_V1.size:
@@ -1196,12 +1242,18 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
                     _magic, _version, quality, lux, visible, infrared, full,
                     gain_index,
                 ) = self.MEASUREMENT_PACKET_V1.unpack(data)
-                battery_mv = battery_percent = None
+                battery_mv = battery_percent = usb_connected = None
             elif version == 2 and len(data) == self.MEASUREMENT_PACKET_V2.size:
                 (
                     _magic, _version, quality, lux, visible, infrared, full,
                     gain_index, battery_mv, battery_percent,
                 ) = self.MEASUREMENT_PACKET_V2.unpack(data)
+                usb_connected = None
+            elif version == 3 and len(data) == self.MEASUREMENT_PACKET_V3.size:
+                (
+                    _magic, _version, quality, lux, visible, infrared, full,
+                    gain_index, battery_mv, battery_percent, usb_connected,
+                ) = self.MEASUREMENT_PACKET_V3.unpack(data)
             else:
                 self._log(
                     f"[WARN] Ambient BLE measurement version "
@@ -1222,12 +1274,16 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
                 ),
                 battery_percent=battery_percent,
                 battery_voltage=(battery_mv / 1000.0 if battery_mv is not None else None),
+                usb_connected=usb_connected,
             )
             if accepted and not self._logged_first_measurement:
                 self._logged_first_measurement = True
                 self._log(
                     f"Ambient BLE first valid measurement received: "
-                    f"lux={lux:.3f}, visible={visible}, quality=0x{quality:02x}."
+                    f"lux={lux:.3f}, visible={visible}, quality=0x{quality:02x}, "
+                    f"battery={battery_percent}% ({battery_mv}mV), "
+                    f"usb={usb_connected}, "
+                    f"packet={bytes(data).hex()}."
                 )
             elif not accepted and not self._logged_invalid_measurement:
                 self._logged_invalid_measurement = True
@@ -1235,6 +1291,14 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
                     f"[WARN] Ambient BLE rejected non-finite measurement: "
                     f"lux={lux}, visible={visible}, ir={infrared}, "
                     f"full={full}, quality=0x{quality:02x}."
+                )
+            if (accepted and usb_connected is not None and
+                    usb_connected != self._last_logged_usb_connected):
+                self._last_logged_usb_connected = usb_connected
+                self._log(
+                    f"Ambient BLE USB state changed: usb={usb_connected}, "
+                    f"battery={battery_percent}% ({battery_mv}mV), "
+                    f"packet={bytes(data).hex()}."
                 )
             if accepted and self._measurement_event is not None:
                 self._measurement_event.set()
