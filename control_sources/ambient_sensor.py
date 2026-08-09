@@ -389,6 +389,10 @@ class UsbSerialAmbientReader:
         try:
             self.serial_port = serial.Serial(port, baudrate=baudrate, timeout=timeout)
             self.port_name = port
+            # TinyUSB CDC on the XIAO uses the host control-line state to mark
+            # the session active. Assert both lines explicitly on Windows.
+            self.serial_port.dtr = True
+            self.serial_port.rts = True
         except Exception as exc:
             self.available = False
             self.last_error = str(exc)
@@ -400,8 +404,13 @@ class UsbSerialAmbientReader:
         self.running = True
         self.thread = threading.Thread(target=self._read_loop, daemon=True)
         self.thread.start()
-        self.apply_saved_config()
-        self.request_measurement(force=True)
+        # The first packet can race the CDC control-line transition after the
+        # port opens. Repeat the idempotent startup commands so configuration
+        # and the initial measurement request cannot be lost.
+        for _attempt in range(3):
+            self.apply_saved_config()
+            self.request_measurement(force=True)
+            time.sleep(0.25)
         print(f"Ambient USB source connected on {port}.")
         return True
 
@@ -720,6 +729,16 @@ class UsbSerialAmbientReader:
         if lux is None and not saturated:
             return None
 
+        battery_mv = first(
+            "batteryMillivolts", "battery_mv", "battery_millivolts"
+        )
+        try:
+            battery_voltage = (
+                float(battery_mv) / 1000.0 if battery_mv is not None else None
+            )
+        except (TypeError, ValueError):
+            battery_voltage = None
+
         return {
             "lux": lux,
             "visible": first("visible", "vis", "v", "raw_visible", "ch_visible"),
@@ -728,6 +747,11 @@ class UsbSerialAmbientReader:
             "saturated": saturated,
             "quality": quality,
             "range_id": first("r", "range", "range_id", "gain", "g", "cal", "calibration", "profile"),
+            "battery_percent": first(
+                "batteryPercent", "battery_percent", "battery"
+            ),
+            "battery_voltage": battery_voltage,
+            "usb_connected": True,
         }
 
     def _quality_from_flags(self, data):
@@ -846,6 +870,29 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
         self._logged_first_measurement = False
         self._logged_invalid_measurement = False
         self._last_logged_usb_connected = None
+        self._diagnostics_lock = threading.Lock()
+        self._diagnostic_state = "idle"
+        self._diagnostic_events = []
+
+    def _record_diagnostic(self, state, detail=None):
+        """Keep a small, thread-safe connection history for the UI."""
+        message = str(detail).strip() if detail is not None else ""
+        entry = {
+            "at": time.time(),
+            "state": str(state),
+            "detail": message,
+        }
+        with self._diagnostics_lock:
+            self._diagnostic_state = entry["state"]
+            self._diagnostic_events.append(entry)
+            del self._diagnostic_events[:-30]
+
+    def diagnostics(self):
+        with self._diagnostics_lock:
+            return {
+                "state": self._diagnostic_state,
+                "events": [dict(entry) for entry in self._diagnostic_events],
+            }
 
     def _log(self, message):
         print(message)
@@ -882,6 +929,7 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
         ).strip()
         self.thread = threading.Thread(target=self._thread_main, daemon=True)
         self.thread.start()
+        self._record_diagnostic("starting", f"Looking for {self.port_name!r}")
         self._log(f"Ambient BLE source is looking for {self.port_name!r}.")
         return True
 
@@ -894,11 +942,17 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
             return False
         return True
 
+    def is_connected(self):
+        """Return whether the peripheral currently has an active BLE link."""
+        client = self.client
+        return bool(client is not None and client.is_connected)
+
     def stop(self):
         was_active = self.running or self.available or self.client is not None
         if was_active:
             self._log("Ambient BLE source is stopping.")
         self.running = False
+        self._record_diagnostic("stopping", "Stop requested")
         loop = self.event_loop
         client = self.client
         ble_task = self._ble_task
@@ -937,6 +991,7 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
         self.port_name = None
         self.controller.close()
         if was_active:
+            self._record_diagnostic("stopped", "BLE worker stopped")
             self._log("Ambient BLE source stopped.")
 
     def request_measurement(self, force=False):
@@ -1101,8 +1156,10 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
         )
         while self.running:
             try:
+                self._record_diagnostic("scanning", "Searching for the configured sensor")
                 client, device, disconnected = await self._connect_once()
                 self.client = client
+                self._record_diagnostic("subscribing", "Enabling sensor notifications")
                 await client.start_notify(self.NUS_TX_UUID, self._on_notification)
                 self.last_error = None
                 self.port_name = device.address
@@ -1115,18 +1172,22 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
                 previous_config_at = self._last_config_at or 0.0
                 self._last_config_error = None
                 self._config_response_event.clear()
+                self._record_diagnostic("configuring", "Sending saved sensor configuration")
                 await self._write_json_async(saved_config)
+                self._record_diagnostic("configuring", "Waiting for sensor configuration confirmation")
                 await self._wait_for_config_confirmation(
                     previous_config_at,
                     expected_config,
                 )
                 self._measurement_event.clear()
+                self._record_diagnostic("waiting_measurement", "Requesting the first measurement")
                 await self._write_json_async({"cmd": "get"})
                 await asyncio.wait_for(
                     self._measurement_event.wait(),
                     timeout=10.0,
                 )
                 self.available = True
+                self._record_diagnostic("connected", f"Connected to {device.name or device.address} ({device.address})")
                 self._log(
                     f"Ambient BLE source connected to "
                     f"{device.name or device.address} ({device.address})."
@@ -1149,6 +1210,7 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
             except Exception as exc:
                 detail = str(exc).strip() or type(exc).__name__
                 self.last_error = detail
+                self._record_diagnostic("failed", f"{type(exc).__name__}: {detail}")
                 self._log(
                     f"[WARN] Ambient BLE connection failed "
                     f"({type(exc).__name__}): {detail}"
@@ -1164,6 +1226,7 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
                         pass
 
             if self.running:
+                self._record_diagnostic("reconnecting", f"Retrying in {reconnect_seconds:g} s")
                 await asyncio.sleep(reconnect_seconds)
 
     async def _connect_once(self):
@@ -1198,6 +1261,8 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
         )
         client = None
         try:
+            target = wanted_address or wanted_name
+            self._record_diagnostic("scanning", f"Scanning for {target!r} (timeout {timeout:g} s)")
             device = await BleakScanner.find_device_by_filter(
                 matches_device,
                 timeout=timeout,
@@ -1207,6 +1272,7 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
                     f"{wanted_name!r} introuvable après {timeout:g} s; "
                     "il est peut-être déjà connecté à une autre instance."
                 )
+            self._record_diagnostic("connecting", f"Found {device.name or device.address}; opening BLE link")
             client = BleakClient(
                 device,
                 disconnected_callback=on_disconnect,
@@ -1224,6 +1290,7 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
                     f"délai dépassé pendant la connexion Windows à "
                     f"{wanted_name!r}"
                 ) from exc
+            self._record_diagnostic("connecting", "BLE link established")
             return client, device, disconnected
         except BaseException:
             if client is not None and client.is_connected:
@@ -1336,26 +1403,126 @@ class AmbientSensorControlSource:
     def __init__(self):
         self.controller = AmbientLightController()
         self._reconnect_lock = threading.Lock()
+        self._unavailable_callback = None
+        self._handover_deadline = 0.0
+        self.reader = self._new_preferred_reader()
+
+    def _configured_transport(self):
         transport = str(
-            getattr(config, "AMBIENT_SENSOR_TRANSPORT", "ble") or "ble"
+            getattr(config, "AMBIENT_SENSOR_TRANSPORT", "auto") or "auto"
         ).strip().lower()
+        return transport if transport in ("auto", "usb", "ble") else "auto"
+
+    def _preferred_reader_class(self):
+        transport = self._configured_transport()
         if transport == "usb":
-            self.reader = UsbSerialAmbientReader(self.controller)
-        else:
-            self.reader = BleNusAmbientReader(self.controller)
+            return UsbSerialAmbientReader
+        if transport == "ble":
+            return BleNusAmbientReader
+
+        # In automatic mode USB always has priority. A disconnected USB CDC
+        # port must not pin the source to a dead reader: the next start then
+        # creates a BLE reader, and the reverse happens when USB reappears.
+        usb_probe = UsbSerialAmbientReader(self.controller)
+        if usb_probe.is_port_available():
+            return UsbSerialAmbientReader
+        return BleNusAmbientReader
+
+    def _new_preferred_reader(self):
+        reader = self._preferred_reader_class()(self.controller)
+        reader.on_unavailable = self._reader_unavailable
+        return reader
+
+    def _begin_handover(self):
+        if getattr(self, "_handover_deadline", 0.0):
+            return
+        try:
+            grace = float(
+                getattr(config, "AMBIENT_TRANSPORT_HANDOVER_SECONDS", 15.0)
+            )
+        except (TypeError, ValueError):
+            grace = 15.0
+        self._handover_deadline = time.monotonic() + max(2.0, grace)
+
+    def _reader_unavailable(self, exc):
+        if self._configured_transport() == "auto":
+            self._begin_handover()
+            if type(self.reader) is UsbSerialAmbientReader:
+                self.controller.on_usb_state(False)
+        if self._unavailable_callback is not None:
+            self._unavailable_callback(exc)
+
+    def is_handover_pending(self):
+        return bool(
+            self._configured_transport() == "auto"
+            and getattr(self, "_handover_deadline", 0.0)
+            and time.monotonic() < self._handover_deadline
+            and not self.reader.available
+        )
+
+    def _ensure_preferred_reader(self):
+        # Keep injected reader doubles/adapters intact (used by tests and by
+        # callers embedding the control source).
+        if not isinstance(
+            self.reader, (UsbSerialAmbientReader, BleNusAmbientReader)
+        ):
+            return self.reader
+        reader_class = self._preferred_reader_class()
+        # BleNusAmbientReader inherits UsbSerialAmbientReader, so an exact type
+        # comparison is required here.
+        if type(self.reader) is reader_class:
+            self.reader.on_unavailable = self._reader_unavailable
+            return self.reader
+
+        old_reader = self.reader
+        if old_reader.running:
+            old_reader.stop()
+        self.reader = reader_class(self.controller)
+        self.reader.on_unavailable = self._reader_unavailable
+        return self.reader
+
+    def switch_to_preferred_transport(self):
+        """Start a non-blocking auto handover when a higher-priority USB
+        transport appears while BLE is still running.
+        """
+        if self._configured_transport() != "auto":
+            return False
+        if not isinstance(
+            self.reader, (UsbSerialAmbientReader, BleNusAmbientReader)
+        ):
+            return False
+        reader_class = self._preferred_reader_class()
+        if type(self.reader) is reader_class:
+            return False
+        if not self._reconnect_lock.acquire(blocking=False):
+            return True
+
+        self._begin_handover()
+        self.controller.on_usb_state(reader_class is UsbSerialAmbientReader)
+
+        def switch():
+            try:
+                self.reader.stop()
+                self._ensure_preferred_reader().start()
+            finally:
+                self._reconnect_lock.release()
+
+        threading.Thread(target=switch, daemon=True).start()
+        return True
 
     def set_unavailable_callback(self, callback):
-        self.reader.on_unavailable = callback
+        self._unavailable_callback = callback
+        self.reader.on_unavailable = self._reader_unavailable
 
     def start(self):
         if not bool(getattr(config, "AMBIENT_SOURCE_ENABLED", False)):
             return None
         self.controller.apply_enabled = True
-        return self.reader.start()
+        return self._ensure_preferred_reader().start()
 
     def start_passive(self):
         self.controller.apply_enabled = bool(getattr(config, "AMBIENT_SOURCE_ENABLED", False))
-        return self.reader.start()
+        return self._ensure_preferred_reader().start()
 
     def set_enabled(self, enabled):
         enabled = bool(enabled)
@@ -1367,11 +1534,12 @@ class AmbientSensorControlSource:
             # immediately. Waiting for a changed measurement leaves the
             # display at the previous Manual value indefinitely.
             self.controller.recalculate_current()
-            return self.reader.start()
+            return self._ensure_preferred_reader().start()
         self.controller.close()
         return True
 
     def stop(self):
+        self._handover_deadline = 0.0
         self.controller.apply_enabled = False
         self.reader.stop()
 
@@ -1406,9 +1574,12 @@ class AmbientSensorControlSource:
 
         def reconnect():
             try:
+                record = getattr(self.reader, "_record_diagnostic", None)
+                if record is not None:
+                    record("reconnecting", "Forced reconnect requested from the UI")
                 self.reader.stop()
                 time.sleep(0.5)
-                self.reader.start()
+                self._ensure_preferred_reader().start()
             finally:
                 self._reconnect_lock.release()
 
@@ -1424,22 +1595,45 @@ class AmbientSensorControlSource:
         This is intentionally different from is_available(), which becomes
         true only after the sensor has connected and delivered a reading.
         """
+        if self._configured_transport() == "auto":
+            return (
+                UsbSerialAmbientReader(self.controller).is_port_available()
+                or BleNusAmbientReader(self.controller).is_port_available()
+            )
         return self.reader.is_port_available()
 
     def recalculate_current(self):
         return self.controller.recalculate_current()
 
     def is_available(self):
-        return bool(self.reader.available)
+        if self.reader.available:
+            self._handover_deadline = 0.0
+            return True
+        return self.is_handover_pending()
+
+    def is_ble_connected(self):
+        is_connected = getattr(self.reader, "is_connected", None)
+        return bool(is_connected and is_connected())
 
     def status(self):
         data = self.controller.status()
+        data["transport"] = (
+            "ble" if isinstance(self.reader, BleNusAmbientReader) else "usb"
+        )
         data["running"] = self.reader.running
         data["port"] = self.reader.port_name
-        data["available"] = self.reader.available
+        data["transport_connected"] = self.reader.available
+        data["available"] = self.is_available()
+        data["transitioning"] = self.is_handover_pending()
+        data["ble_connected"] = self.is_ble_connected()
         data["error"] = self.reader.last_error
         data["sensor_config"] = self.reader._last_config
         data["sensor_config_age"] = None if self.reader._last_config_at is None else time.monotonic() - self.reader._last_config_at
         data["sensor_config_received_at"] = self.reader._last_config_at
         data["sensor_config_error"] = self.reader._last_config_error
+        diagnostics = getattr(self.reader, "diagnostics", None)
+        if diagnostics is not None:
+            data["diagnostics"] = diagnostics()
+        else:
+            data["diagnostics"] = {"state": "connected" if data["available"] else "idle", "events": []}
         return data

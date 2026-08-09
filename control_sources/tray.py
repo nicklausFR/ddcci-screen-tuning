@@ -140,14 +140,14 @@ class TrayControlSource:
             self.panel.set_source_control(source)
 
     def _sync_source_availability(self):
-        ambient_available = (
+        ambient_connected = (
             self.ambient_source is not None
             and self._ambient_watch_enabled
             and self.ambient_source.is_available()
         )
-        self._last_ambient_available = ambient_available
+        self._last_ambient_available = ambient_connected
         if self.panel is not None and hasattr(self.panel, "set_source_available"):
-            self.panel.set_source_available("ambient", ambient_available)
+            self.panel.set_source_available("ambient", ambient_connected)
 
     def _poll_ambient_availability(self):
         if self.ambient_source is None:
@@ -155,27 +155,46 @@ class TrayControlSource:
         if not self._ambient_watch_enabled:
             return
         ambient_requested = bool(getattr(config, "AMBIENT_SOURCE_ENABLED", False))
+        if (
+            ambient_requested
+            and self.ambient_source.switch_to_preferred_transport()
+        ):
+            self._sync_tray_source_menu("ambient")
+            self._sync_source_availability()
+            return
         if ambient_requested and not self.ambient_source.is_running():
             if self.ambient_source.start():
                 self._sync_tray_source_menu("ambient")
                 self._update_auto_nightlight_timer()
                 self._sync_source_availability()
                 return
-        ambient_available = self.ambient_source.is_available()
-        if ambient_available == self._last_ambient_available:
+        ambient_connected = self.ambient_source.is_available()
+        if ambient_connected == self._last_ambient_available:
             return
-        self._last_ambient_available = ambient_available
-        if ambient_available and ambient_requested:
+        self._last_ambient_available = ambient_connected
+        if ambient_connected and ambient_requested:
             self.set_daytime_enabled(False)
             if self.ambient_source.start():
                 self._sync_tray_source_menu("ambient")
                 self._update_auto_nightlight_timer()
-            ambient_available = self.ambient_source.is_available()
-            self._last_ambient_available = ambient_available
+            ambient_connected = self.ambient_source.is_available()
+            self._last_ambient_available = ambient_connected
         if self.panel is not None and hasattr(self.panel, "set_source_available"):
-            self.panel.set_source_available("ambient", ambient_available)
+            self.panel.set_source_available("ambient", ambient_connected)
 
     def _ambient_source_unavailable(self, exc):
+        if (
+            bool(getattr(config, "AMBIENT_SOURCE_ENABLED", False))
+            and self.ambient_source is not None
+            and self.ambient_source.is_handover_pending()
+        ):
+            print("[NOTICE] Ambient transport handover in progress:", exc)
+            # Keep Sensor selected and its last measurement active while the
+            # automatic transport recreates a reader for USB or BLE.
+            self._sync_tray_source_menu("ambient")
+            self._sync_source_availability()
+            QTimer.singleShot(0, self._resume_ambient_handover)
+            return
         print("[WARN] Ambient source unavailable, switching to manual:", exc)
         if bool(getattr(config, "AMBIENT_SOURCE_ENABLED", False)):
             self.set_daytime_enabled(False)
@@ -183,6 +202,17 @@ class TrayControlSource:
             self.apply_tray_values()
         self._sync_source_availability()
         self._update_auto_nightlight_timer()
+
+    def _resume_ambient_handover(self):
+        if (
+            self.ambient_source is None
+            or not bool(getattr(config, "AMBIENT_SOURCE_ENABLED", False))
+        ):
+            return
+        if not self.ambient_source.is_running():
+            self.ambient_source.start()
+        self._sync_tray_source_menu("ambient")
+        self._sync_source_availability()
 
     def _nightlight_source(self):
         source = str(getattr(config, "NIGHTLIGHT_SOURCE", "manual"))
@@ -345,13 +375,7 @@ class TrayControlSource:
 
     def _available_sources(self):
         sources = {"tray", "daytime"}
-        # Keep Sensor selectable before the first BLE connection. Previously
-        # the panel only showed it after is_available() became true, even
-        # though selecting it is what starts the BLE reader.
-        if (
-            self.ambient_source is not None
-            and self.ambient_source.is_transport_available()
-        ):
+        if self.ambient_source is not None and self.ambient_source.is_available():
             sources.add("ambient")
         return sources
 

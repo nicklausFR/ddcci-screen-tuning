@@ -1,4 +1,4 @@
-from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QSlider, QLabel, QPushButton, QComboBox, QSystemTrayIcon, QMenu, QDialog, QLineEdit, QListWidget, QListWidgetItem, QStackedWidget, QTabWidget)
+from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QSlider, QLabel, QPushButton, QComboBox, QSystemTrayIcon, QMenu, QDialog, QLineEdit, QListWidget, QListWidgetItem, QStackedWidget, QTabWidget, QPlainTextEdit)
 from PySide6.QtGui import QIcon, QFont, QAction, QActionGroup, QColor, QPainter, QPen, QBrush, QPalette, QCursor
 from PySide6.QtCore import Qt, QSize, QTimer, Signal
 from monitor import DDCCI_Monitor
@@ -2345,14 +2345,19 @@ class PopupPanel(QWidget):
         """)
         main_tab = QWidget()
         advanced_tab = QWidget()
+        debug_tab = QWidget()
         layout = QVBoxLayout(main_tab)
         layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(8)
         advanced_layout = QVBoxLayout(advanced_tab)
         advanced_layout.setContentsMargins(16, 14, 16, 14)
         advanced_layout.setSpacing(8)
+        debug_layout = QVBoxLayout(debug_tab)
+        debug_layout.setContentsMargins(16, 14, 16, 14)
+        debug_layout.setSpacing(8)
         tabs.addTab(main_tab, "Main")
         tabs.addTab(advanced_tab, "Advanced")
+        tabs.addTab(debug_tab, "Debug")
         root_layout.addWidget(tabs)
         started_passive = {"value": False}
 
@@ -2422,6 +2427,19 @@ class PopupPanel(QWidget):
         sensor_reconnect_button.setStyleSheet(field_style)
         advanced_layout.addWidget(sensor_reconnect_button)
         advanced_layout.addStretch()
+        debug_summary_label = label("Waiting for sensor status", bold=True)
+        debug_layout.addWidget(debug_summary_label)
+        debug_target_label = label("")
+        debug_target_label.setWordWrap(True)
+        debug_layout.addWidget(debug_target_label)
+        debug_error_label = label("")
+        debug_error_label.setWordWrap(True)
+        debug_layout.addWidget(debug_error_label)
+        debug_log = QPlainTextEdit()
+        debug_log.setReadOnly(True)
+        debug_log.setMinimumHeight(230)
+        debug_log.setStyleSheet(field_style)
+        debug_layout.addWidget(debug_log, 1)
         sensor_config_last = {
             "values": {
                 "refreshMs": self._config_int("AMBIENT_SENSOR_REFRESH_MS", 100),
@@ -2651,6 +2669,46 @@ class PopupPanel(QWidget):
             if self.ambient_source is None:
                 return
             status = self.ambient_source.status()
+            diagnostics = status.get("diagnostics") or {}
+            diagnostic_state = diagnostics.get("state") or "unknown"
+            target_name = str(getattr(self.config, "AMBIENT_BLE_NAME", "LuxSensor") or "LuxSensor")
+            target_address = str(getattr(self.config, "AMBIENT_BLE_ADDRESS", "") or "").strip()
+            transport = str(status.get("transport") or getattr(
+                self.config, "AMBIENT_SENSOR_TRANSPORT", "ble"
+            ) or "ble").upper()
+            using_usb = transport == "USB"
+            debug_summary_label.setText(
+                f"State: {diagnostic_state} | running: {'yes' if status.get('running') else 'no'} | "
+                f"{'USB CDC: connected' if using_usb and status.get('running') else ('USB CDC: disconnected' if using_usb else 'BLE link: ' + ('yes' if status.get('ble_connected') else 'no'))} | "
+                f"measurement ready: {'yes' if status.get('available') else 'no'}"
+            )
+            target_text = f"Transport: {transport} | Target: {target_name}"
+            if using_usb:
+                port = status.get("port") or "auto-detect pending"
+                target_text += (
+                    f" | Port: {port} | Firmware mode: BLE disabled while USB is connected"
+                )
+            elif target_address:
+                target_text += f" | Address: {target_address}"
+            debug_target_label.setText(target_text)
+            error = status.get("error")
+            debug_error_label.setText(f"Last error: {error}" if error else "Last error: none")
+            event_lines = []
+            for event in diagnostics.get("events", []):
+                try:
+                    timestamp = time.strftime("%H:%M:%S", time.localtime(event.get("at", 0)))
+                except (TypeError, ValueError, OverflowError):
+                    timestamp = "--:--:--"
+                line = f"{timestamp}  {event.get('state', 'unknown')}"
+                if event.get("detail"):
+                    line += f" — {event['detail']}"
+                event_lines.append(line)
+            event_text = "\n".join(event_lines) or "No connection events yet."
+            if debug_log.toPlainText() != event_text:
+                debug_log.setPlainText(event_text)
+                debug_log.verticalScrollBar().setValue(
+                    debug_log.verticalScrollBar().maximum()
+                )
             runtime_config = status.get("sensor_config")
             pending_sent_at = sensor_config_pending["sent_at"]
             config_received_at = status.get("sensor_config_received_at")
@@ -3797,10 +3855,7 @@ class PopupPanel(QWidget):
         if available:
             self.available_sources.add(source)
         else:
-            # Sensor must remain selectable after a failed discovery so the
-            # user can start or retry the BLE connection from the panel.
-            if source != "ambient":
-                self.available_sources.discard(source)
+            self.available_sources.discard(source)
             if self.active_source == source:
                 self.active_source = "tray"
         self._populate_source_selector()
@@ -3829,6 +3884,16 @@ class PopupPanel(QWidget):
         if self.ambient_source is None:
             return "Sensor"
         status = self.ambient_source.status()
+        # During an automatic handover, `available` intentionally remains true
+        # so Sensor stays selected. Battery data is not trustworthy until the
+        # new physical transport has connected and delivered its first valid
+        # measurement (BLE only sets transport_connected at that point).
+        if (
+            not status.get("available")
+            or status.get("transitioning")
+            or not status.get("transport_connected")
+        ):
+            return "Sensor"
         percent = status.get("battery_percent")
         if status.get("usb_connected") is True:
             return "Sensor en charge"

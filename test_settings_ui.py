@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QPushButton,
     QSlider,
+    QTabWidget,
     QWidget,
 )
 
@@ -36,6 +37,14 @@ class FakeMonitor:
 
     def nightlight_get_strength(self):
         return 25
+
+
+class FakeAmbientSource:
+    def __init__(self, status):
+        self._status = status
+
+    def status(self):
+        return dict(self._status)
 
 
 class SettingsUiTests(unittest.TestCase):
@@ -104,6 +113,17 @@ class SettingsUiTests(unittest.TestCase):
         }
         self.assertNotIn("Apply", button_texts)
 
+    def test_light_sensor_settings_include_debug_tab(self):
+        page = QWidget()
+        self.panel._build_ambient_sensor_settings(page)
+
+        tabs = page.findChild(QTabWidget)
+        self.assertIsNotNone(tabs)
+        self.assertEqual(
+            [tabs.tabText(index) for index in range(tabs.count())],
+            ["Main", "Advanced", "Debug"],
+        )
+
     def test_representative_controls_save_immediately(self):
         light_page = QWidget()
         self.panel._build_light_curve_settings(light_page, include_close=False)
@@ -153,6 +173,25 @@ class SettingsUiTests(unittest.TestCase):
 
         for key in ("light", "brightness", "contrast"):
             self.assertTrue(self.panel.sliders[key].isEnabled())
+
+    def test_sensor_battery_is_hidden_until_ble_handover_is_connected(self):
+        self.panel.ambient_source = FakeAmbientSource({
+            "available": True,
+            "transitioning": True,
+            "transport_connected": False,
+            "usb_connected": True,
+            "battery_percent": 255,
+        })
+        self.assertEqual(self.panel._ambient_source_label(), "Sensor")
+
+        self.panel.ambient_source = FakeAmbientSource({
+            "available": True,
+            "transitioning": False,
+            "transport_connected": True,
+            "usb_connected": False,
+            "battery_percent": 72,
+        })
+        self.assertEqual(self.panel._ambient_source_label(), "Sensor 72%")
 
 
 if __name__ == "__main__":
