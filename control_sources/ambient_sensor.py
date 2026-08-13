@@ -1154,6 +1154,7 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
         reconnect_seconds = self._config_float(
             "AMBIENT_BLE_RECONNECT_SECONDS", 3.0, 0.5, 60.0
         )
+        consecutive_failures = 0
         while self.running:
             try:
                 self._record_diagnostic("scanning", "Searching for the configured sensor")
@@ -1187,6 +1188,7 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
                     timeout=10.0,
                 )
                 self.available = True
+                consecutive_failures = 0
                 self._record_diagnostic("connected", f"Connected to {device.name or device.address} ({device.address})")
                 self._log(
                     f"Ambient BLE source connected to "
@@ -1208,6 +1210,7 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
                         )
                         next_heartbeat = now + 30.0
             except Exception as exc:
+                consecutive_failures += 1
                 detail = str(exc).strip() or type(exc).__name__
                 self.last_error = detail
                 self._record_diagnostic("failed", f"{type(exc).__name__}: {detail}")
@@ -1219,15 +1222,22 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
                 self.available = False
                 client = self.client
                 self.client = None
-                if client is not None and client.is_connected:
+                if client is not None:
                     try:
                         await client.disconnect()
                     except Exception:
                         pass
 
             if self.running:
-                self._record_diagnostic("reconnecting", f"Retrying in {reconnect_seconds:g} s")
-                await asyncio.sleep(reconnect_seconds)
+                retry_delay = min(
+                    20.0,
+                    reconnect_seconds *
+                    (2 ** min(max(consecutive_failures - 1, 0), 3)),
+                )
+                self._record_diagnostic(
+                    "reconnecting", f"Retrying in {retry_delay:g} s"
+                )
+                await asyncio.sleep(retry_delay)
 
     async def _connect_once(self):
         from bleak import BleakClient, BleakScanner
@@ -1277,7 +1287,6 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
                 device,
                 disconnected_callback=on_disconnect,
                 timeout=30.0,
-                services={self.NUS_SERVICE_UUID},
                 winrt={
                     "address_type": "random",
                     "use_cached_services": False,
@@ -1293,8 +1302,11 @@ class BleNusAmbientReader(UsbSerialAmbientReader):
             self._record_diagnostic("connecting", "BLE link established")
             return client, device, disconnected
         except BaseException:
-            if client is not None and client.is_connected:
-                await client.disconnect()
+            if client is not None:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
             raise
 
     def _on_notification(self, _sender, data):

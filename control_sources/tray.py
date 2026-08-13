@@ -63,9 +63,15 @@ class TrayControlSource:
         ambient_enabled = bool(getattr(config, "AMBIENT_SOURCE_ENABLED", False))
         startup_ambient_available = self.ambient_source is not None and self.ambient_source.is_available()
         self._ambient_seen_at_start = startup_ambient_available
+        # Keep discovering an installed sensor even while Manual is selected.
+        # Otherwise a sensor switched on after the app starts can connect in
+        # the diagnostics page but never cause the source selector to be
+        # refreshed.  ``is_transport_available`` only checks whether the
+        # configured transport can be used (for BLE, that bleak is present),
+        # so it does not claim that a physical sensor is already connected.
         self._ambient_watch_enabled = (
             self.ambient_source is not None
-            and (ambient_enabled or startup_ambient_available)
+            and self.ambient_source.is_transport_available()
         )
         self.tray_icon = create_tray_icon(
             self.show_active_source_window,
@@ -155,17 +161,27 @@ class TrayControlSource:
         if not self._ambient_watch_enabled:
             return
         ambient_requested = bool(getattr(config, "AMBIENT_SOURCE_ENABLED", False))
-        if (
-            ambient_requested
-            and self.ambient_source.switch_to_preferred_transport()
-        ):
-            self._sync_tray_source_menu("ambient")
+        if self.ambient_source.switch_to_preferred_transport():
+            # Keep transport discovery active even while Manual is selected.
+            # USB must replace a passive BLE scan too, otherwise charging can
+            # leave the app searching for BLE while the sensor exposes COM.
+            if ambient_requested:
+                self._sync_tray_source_menu("ambient")
             self._sync_source_availability()
             return
-        if ambient_requested and not self.ambient_source.is_running():
-            if self.ambient_source.start():
-                self._sync_tray_source_menu("ambient")
-                self._update_auto_nightlight_timer()
+        if not self.ambient_source.is_running():
+            # Run the reader passively while Manual is selected.  This makes
+            # the selector react when a wireless sensor is switched on later,
+            # without allowing it to apply brightness changes until selected.
+            start_reader = (
+                self.ambient_source.start
+                if ambient_requested
+                else self.ambient_source.start_passive
+            )
+            if start_reader():
+                if ambient_requested:
+                    self._sync_tray_source_menu("ambient")
+                    self._update_auto_nightlight_timer()
                 self._sync_source_availability()
                 return
         ambient_connected = self.ambient_source.is_available()
