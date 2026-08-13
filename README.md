@@ -11,6 +11,40 @@ night-light settings.
 - Configurable light curves for each monitor.
 - Windows light/dark theme support.
 
+## Screenshots
+
+### Main controls
+
+![Main controls](docs/screenshots/main-controls.png)
+
+### Brightness and contrast
+
+![Brightness and contrast curve](docs/screenshots/brightness-contrast-curve.png)
+
+### Automatic control
+
+| Daytime | Ambient-light sensor |
+| --- | --- |
+| ![Daytime settings](docs/screenshots/daytime.png) | ![Ambient-light sensor](docs/screenshots/sensor-main.png) |
+
+### Night-light
+
+| RGB | Gamma ramp |
+| --- | --- |
+| ![Night-light RGB](docs/screenshots/nightlight-rgb.png) | ![Night-light gamma ramp](docs/screenshots/nightlight-gamma.png) |
+
+![Light and night-light link](docs/screenshots/light-color-link.png)
+
+### Other settings
+
+| Smoothing | General settings |
+| --- | --- |
+| ![Smoothing](docs/screenshots/smoothing.png) | ![General settings](docs/screenshots/general-settings.png) |
+
+| Sensor runtime | Sensor diagnostics |
+| --- | --- |
+| ![Sensor runtime](docs/screenshots/sensor-advanced.png) | ![Sensor diagnostics](docs/screenshots/sensor-debug.png) |
+
 ## Ambient-light sensor
 
 Power on the `LuxSensor`, enable Bluetooth in Windows and select the ambient
